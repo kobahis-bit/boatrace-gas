@@ -1,1 +1,687 @@
+/**
+ * ボートレースMC バックテスト
+ * ベースライン比較 GAS v0.1
+ *
+ * 目的:
+ * - 2026-06-01〜2026-06-30を学習期間として、
+ * - 2026-07-08〜2026-07-14を準アウトオブサンプル評価期間とし、
+ * - 以下3モデルを評価する。
+ *
+ *   1. 常に1号艇1着（決定論）
+ *   2. 全国コース別固定確率
+ *   3. 会場別コース固定確率
+ *
+ * 出力先:
+ * - Validation_Summary
+ *
+ * 注意:
+ * - 既存列名・列順は変更しない
+ * - 既存行は削除しない
+ * - 同じTest_IDがある場合は重複追記しない
+ * - Log Lossはゼロ確率回避のためEPSILONでクリップ
+ */
+
+const BL_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  SUMMARY_SHEET: 'Validation_Summary',
+
+  TRAIN_START: '2026-06-01',
+  TRAIN_END: '2026-06-30',
+
+  EVAL_START: '2026-07-08',
+  EVAL_END: '2026-07-14',
+
+  EPSILON: 1e-6,
+
+  // 会場別確率のサンプル不足対策。
+  // venue_count + alpha * national_prob の縮約を使う。
+  VENUE_SHRINKAGE_ALPHA: 30,
+
+  MODEL_VERSION: 'baseline_compare_v0.1'
+});
+
+const BL_SUMMARY_HEADERS = Object.freeze([
+  '順位',
+  'Test_ID',
+  'モデル名',
+  'Noise_SD',
+  'Venue_Weight',
+  'Correlation_Mode',
+  '対象レース数',
+  'Top1_Accuracy',
+  'Brier_Score',
+  'Log_Loss',
+  '1号艇_Brier',
+  '採用候補',
+  'Memo'
+]);
+
+/**
+ * メイン実行関数
+ */
+function runBLBaselineComparisonHoldout() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.openById(BL_CONFIG.SPREADSHEET_ID);
+
+    const raceSheet = blRequireSheet_(ss, BL_CONFIG.RACE_SHEET);
+    const racerSheet = blRequireSheet_(ss, BL_CONFIG.RACER_SHEET);
+    const summarySheet = blRequireSheet_(ss, BL_CONFIG.SUMMARY_SHEET);
+
+    blVerifySummaryHeaders_(summarySheet);
+
+    const raceData = blReadTable_(raceSheet);
+    const racerData = blReadTable_(racerSheet);
+
+    const raceRows = blNormalizeRaceRows_(raceData);
+    const racerRows = blNormalizeRacerRows_(racerData);
+
+    const trainRaces = raceRows.filter(function(row) {
+      return blInDateRange_(
+        row.date,
+        BL_CONFIG.TRAIN_START,
+        BL_CONFIG.TRAIN_END
+      ) && row.resultAvailable && row.winnerBoat >= 1 && row.winnerBoat <= 6;
+    });
+
+    const evalRaces = raceRows.filter(function(row) {
+      return blInDateRange_(
+        row.date,
+        BL_CONFIG.EVAL_START,
+        BL_CONFIG.EVAL_END
+      ) && row.resultAvailable && row.winnerBoat >= 1 && row.winnerBoat <= 6;
+    });
+
+    if (!trainRaces.length) {
+      throw new Error('学習期間の有効レースが0件です。');
+    }
+
+    if (!evalRaces.length) {
+      throw new Error('評価期間の有効レースが0件です。');
+    }
+
+    blValidateSixRacersPerRace_(evalRaces, racerRows);
+
+    const nationalProb = blBuildNationalCourseProbabilities_(trainRaces);
+    const venueProbMap = blBuildVenueCourseProbabilities_(
+      trainRaces,
+      nationalProb,
+      BL_CONFIG.VENUE_SHRINKAGE_ALPHA
+    );
+
+    const models = [
+      {
+        testId: blBuildTestId_('always_boat1'),
+        modelName: 'Baseline / 常に1号艇1着',
+        probabilityFn: function() {
+          return [1, 0, 0, 0, 0, 0];
+        },
+        memo:
+          'TRAINなし。EVAL=' +
+          BL_CONFIG.EVAL_START +
+          '〜' +
+          BL_CONFIG.EVAL_END +
+          '。決定論ベースライン。'
+      },
+      {
+        testId: blBuildTestId_('national_course_fixed'),
+        modelName: 'Baseline / 全国コース別固定確率',
+        probabilityFn: function() {
+          return nationalProb.slice();
+        },
+        memo:
+          'TRAIN=' +
+          BL_CONFIG.TRAIN_START +
+          '〜' +
+          BL_CONFIG.TRAIN_END +
+          '、EVAL=' +
+          BL_CONFIG.EVAL_START +
+          '〜' +
+          BL_CONFIG.EVAL_END +
+          '。学習期間の艇番別1着率を固定使用。'
+      },
+      {
+        testId: blBuildTestId_('venue_course_fixed'),
+        modelName: 'Baseline / 会場別コース固定確率',
+        probabilityFn: function(race) {
+          return (
+            venueProbMap[race.venueCode] ||
+            nationalProb
+          ).slice();
+        },
+        memo:
+          'TRAIN=' +
+          BL_CONFIG.TRAIN_START +
+          '〜' +
+          BL_CONFIG.TRAIN_END +
+          '、EVAL=' +
+          BL_CONFIG.EVAL_START +
+          '〜' +
+          BL_CONFIG.EVAL_END +
+          '。会場別艇番確率を全国確率へ縮約。alpha=' +
+          BL_CONFIG.VENUE_SHRINKAGE_ALPHA +
+          '。'
+      }
+    ];
+
+    const existingIds = blReadExistingTestIds_(summarySheet);
+    const resultRows = [];
+    const results = [];
+
+    models.forEach(function(model) {
+      const metrics = blEvaluateModel_(
+        evalRaces,
+        model.probabilityFn,
+        BL_CONFIG.EPSILON
+      );
+
+      results.push({
+        testId: model.testId,
+        modelName: model.modelName,
+        metrics: metrics
+      });
+
+      if (existingIds.has(model.testId)) {
+        console.log('既存Test_IDのため追記スキップ: ' + model.testId);
+        return;
+      }
+
+      resultRows.push([
+        '',
+        model.testId,
+        model.modelName,
+        '',
+        '',
+        'baseline',
+        metrics.raceCount,
+        metrics.top1Accuracy,
+        metrics.brierScore,
+        metrics.logLoss,
+        metrics.boat1Brier,
+        false,
+        model.memo
+      ]);
+    });
+
+    if (resultRows.length) {
+      const startRow = blFindAppendRow_(summarySheet);
+      summarySheet
+        .getRange(
+          startRow,
+          1,
+          resultRows.length,
+          BL_SUMMARY_HEADERS.length
+        )
+        .setValues(resultRows);
+
+      blFormatSummaryRows_(summarySheet, startRow, resultRows.length);
+      SpreadsheetApp.flush();
+    }
+
+    console.log(
+      JSON.stringify(
+        {
+          status: 'COMPLETED',
+          trainRaceCount: trainRaces.length,
+          evalRaceCount: evalRaces.length,
+          nationalProbabilities: nationalProb,
+          venueCount: Object.keys(venueProbMap).length,
+          appendedRows: resultRows.length,
+          results: results
+        },
+        null,
+        2
+      )
+    );
+
+    return {
+      status: 'COMPLETED',
+      trainRaceCount: trainRaces.length,
+      evalRaceCount: evalRaces.length,
+      appendedRows: resultRows.length,
+      results: results
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 書き込みなしの事前確認
+ */
+function checkBLBaselineComparisonReady() {
+  const ss = SpreadsheetApp.openById(BL_CONFIG.SPREADSHEET_ID);
+
+  const raceSheet = blRequireSheet_(ss, BL_CONFIG.RACE_SHEET);
+  const racerSheet = blRequireSheet_(ss, BL_CONFIG.RACER_SHEET);
+  const summarySheet = blRequireSheet_(ss, BL_CONFIG.SUMMARY_SHEET);
+
+  blVerifySummaryHeaders_(summarySheet);
+
+  const raceData = blReadTable_(raceSheet);
+  const racerData = blReadTable_(racerSheet);
+
+  const raceRows = blNormalizeRaceRows_(raceData);
+  const racerRows = blNormalizeRacerRows_(racerData);
+
+  const trainRaces = raceRows.filter(function(row) {
+    return blInDateRange_(
+      row.date,
+      BL_CONFIG.TRAIN_START,
+      BL_CONFIG.TRAIN_END
+    ) && row.resultAvailable && row.winnerBoat >= 1 && row.winnerBoat <= 6;
+  });
+
+  const evalRaces = raceRows.filter(function(row) {
+    return blInDateRange_(
+      row.date,
+      BL_CONFIG.EVAL_START,
+      BL_CONFIG.EVAL_END
+    ) && row.resultAvailable && row.winnerBoat >= 1 && row.winnerBoat <= 6;
+  });
+
+  blValidateSixRacersPerRace_(evalRaces, racerRows);
+
+  const result = {
+    status: 'READY',
+    spreadsheet: ss.getName(),
+    trainPeriod:
+      BL_CONFIG.TRAIN_START +
+      '〜' +
+      BL_CONFIG.TRAIN_END,
+    evalPeriod:
+      BL_CONFIG.EVAL_START +
+      '〜' +
+      BL_CONFIG.EVAL_END,
+    trainRaceCount: trainRaces.length,
+    evalRaceCount: evalRaces.length,
+    racerRows: racerRows.length,
+    summaryHeaderOk: true
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function blEvaluateModel_(races, probabilityFn, epsilon) {
+  let top1Correct = 0;
+  let brierSum = 0;
+  let logLossSum = 0;
+  let boat1BrierSum = 0;
+
+  races.forEach(function(race) {
+    let probabilities = probabilityFn(race);
+
+    probabilities = blNormalizeProbabilityVector_(probabilities);
+
+    const predictedTopBoat =
+      probabilities.indexOf(Math.max.apply(null, probabilities)) + 1;
+
+    if (predictedTopBoat === race.winnerBoat) {
+      top1Correct++;
+    }
+
+    let raceBrier = 0;
+
+    for (let boat = 1; boat <= 6; boat++) {
+      const actual = boat === race.winnerBoat ? 1 : 0;
+      const predicted = probabilities[boat - 1];
+      const diff = predicted - actual;
+      raceBrier += diff * diff;
+    }
+
+    // 既存Validation_Summaryのスケールに合わせ、
+    // 6クラス平均Brierを採用。
+    brierSum += raceBrier / 6;
+
+    const winnerProbability = blClamp_(
+      probabilities[race.winnerBoat - 1],
+      epsilon,
+      1 - epsilon
+    );
+
+    logLossSum += -Math.log(winnerProbability);
+
+    const boat1Actual = race.winnerBoat === 1 ? 1 : 0;
+    const boat1Diff = probabilities[0] - boat1Actual;
+    boat1BrierSum += boat1Diff * boat1Diff;
+  });
+
+  return {
+    raceCount: races.length,
+    top1Accuracy: top1Correct / races.length,
+    brierScore: brierSum / races.length,
+    logLoss: logLossSum / races.length,
+    boat1Brier: boat1BrierSum / races.length
+  };
+}
+
+function blBuildNationalCourseProbabilities_(trainRaces) {
+  const wins = [0, 0, 0, 0, 0, 0];
+
+  trainRaces.forEach(function(race) {
+    wins[race.winnerBoat - 1]++;
+  });
+
+  return blNormalizeProbabilityVector_(wins);
+}
+
+function blBuildVenueCourseProbabilities_(trainRaces, nationalProb, alpha) {
+  const byVenue = {};
+
+  trainRaces.forEach(function(race) {
+    if (!byVenue[race.venueCode]) {
+      byVenue[race.venueCode] = {
+        total: 0,
+        wins: [0, 0, 0, 0, 0, 0]
+      };
+    }
+
+    byVenue[race.venueCode].total++;
+    byVenue[race.venueCode].wins[race.winnerBoat - 1]++;
+  });
+
+  const output = {};
+
+  Object.keys(byVenue).forEach(function(venueCode) {
+    const stats = byVenue[venueCode];
+
+    const smoothed = stats.wins.map(function(winCount, index) {
+      return (
+        winCount +
+        alpha * nationalProb[index]
+      ) / (
+        stats.total + alpha
+      );
+    });
+
+    output[venueCode] = blNormalizeProbabilityVector_(smoothed);
+  });
+
+  return output;
+}
+
+function blNormalizeProbabilityVector_(values) {
+  if (!Array.isArray(values) || values.length !== 6) {
+    throw new Error('確率ベクトルは6要素である必要があります。');
+  }
+
+  const safe = values.map(function(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  });
+
+  const total = safe.reduce(function(sum, value) {
+    return sum + value;
+  }, 0);
+
+  if (total <= 0) {
+    throw new Error('確率ベクトル合計が0です。');
+  }
+
+  return safe.map(function(value) {
+    return value / total;
+  });
+}
+
+function blNormalizeRaceRows_(table) {
+  const headers = table.headers;
+  const index = blHeaderIndex_(headers);
+
+  blRequireHeaders_(headers, [
+    'Race_ID',
+    '日付',
+    '場コード',
+    '場',
+    'R',
+    'Result有',
+    '1着艇'
+  ], BL_CONFIG.RACE_SHEET);
+
+  return table.rows.map(function(row) {
+    return {
+      raceId: String(row[index['Race_ID']] || '').trim(),
+      date: blNormalizeDateText_(row[index['日付']]),
+      venueCode: String(row[index['場コード']] || '').padStart(2, '0'),
+      venueName: String(row[index['場']] || '').trim(),
+      raceNo: blToInt_(row[index['R']]),
+      resultAvailable: blToBoolean_(row[index['Result有']]),
+      winnerBoat: blToInt_(row[index['1着艇']])
+    };
+  }).filter(function(row) {
+    return row.raceId;
+  });
+}
+
+function blNormalizeRacerRows_(table) {
+  const headers = table.headers;
+  const index = blHeaderIndex_(headers);
+
+  blRequireHeaders_(headers, [
+    'Racer_Row_ID',
+    'Race_ID',
+    '艇番',
+    '結果有',
+    '着順'
+  ], BL_CONFIG.RACER_SHEET);
+
+  return table.rows.map(function(row) {
+    return {
+      racerRowId: String(row[index['Racer_Row_ID']] || '').trim(),
+      raceId: String(row[index['Race_ID']] || '').trim(),
+      boatNo: blToInt_(row[index['艇番']]),
+      resultAvailable: blToBoolean_(row[index['結果有']]),
+      finish: blToInt_(row[index['着順']])
+    };
+  }).filter(function(row) {
+    return row.racerRowId && row.raceId;
+  });
+}
+
+function blValidateSixRacersPerRace_(evalRaces, racerRows) {
+  const counts = {};
+
+  racerRows.forEach(function(row) {
+    counts[row.raceId] = (counts[row.raceId] || 0) + 1;
+  });
+
+  const invalid = evalRaces.filter(function(race) {
+    return counts[race.raceId] !== 6;
+  });
+
+  if (invalid.length) {
+    throw new Error(
+      '評価期間に6艇整合しないレースがあります。例: ' +
+      invalid.slice(0, 10).map(function(race) {
+        return race.raceId + '(' + (counts[race.raceId] || 0) + '艇)';
+      }).join(', ')
+    );
+  }
+}
+
+function blReadTable_(sheet) {
+  const values = sheet.getDataRange().getValues();
+
+  if (!values.length) {
+    throw new Error(sheet.getName() + 'が空です。');
+  }
+
+  return {
+    headers: values[0].map(function(value) {
+      return String(value || '').trim();
+    }),
+    rows: values.slice(1)
+  };
+}
+
+function blVerifySummaryHeaders_(sheet) {
+  const actual = sheet
+    .getRange(1, 1, 1, BL_SUMMARY_HEADERS.length)
+    .getDisplayValues()[0];
+
+  const mismatches = [];
+
+  BL_SUMMARY_HEADERS.forEach(function(expected, index) {
+    if (actual[index] !== expected) {
+      mismatches.push(
+        (index + 1) + '列目: "' + actual[index] + '" → "' + expected + '"'
+      );
+    }
+  });
+
+  if (mismatches.length) {
+    throw new Error(
+      'Validation_Summaryのヘッダー不一致: ' +
+      mismatches.join(', ')
+    );
+  }
+}
+
+function blReadExistingTestIds_(sheet) {
+  const set = new Set();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    return set;
+  }
+
+  sheet
+    .getRange(2, 2, lastRow - 1, 1)
+    .getDisplayValues()
+    .forEach(function(row) {
+      const id = String(row[0] || '').trim();
+      if (id) {
+        set.add(id);
+      }
+    });
+
+  return set;
+}
+
+function blFindAppendRow_(sheet) {
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    return 2;
+  }
+
+  const values = sheet
+    .getRange(2, 2, lastRow - 1, 1)
+    .getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim()) {
+      return i + 3;
+    }
+  }
+
+  return 2;
+}
+
+function blFormatSummaryRows_(sheet, startRow, rowCount) {
+  sheet
+    .getRange(startRow, 7, rowCount, 1)
+    .setNumberFormat('0');
+
+  sheet
+    .getRange(startRow, 8, rowCount, 4)
+    .setNumberFormat('0.0000');
+
+  sheet
+    .getRange(startRow, 12, rowCount, 1)
+    .setNumberFormat('General');
+}
+
+function blBuildTestId_(suffix) {
+  return [
+    'HOLDOUT',
+    '20260708_20260714',
+    suffix,
+    BL_CONFIG.MODEL_VERSION
+  ].join('_');
+}
+
+function blRequireSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error('シートがありません: ' + name);
+  }
+
+  return sheet;
+}
+
+function blHeaderIndex_(headers) {
+  const index = {};
+
+  headers.forEach(function(header, i) {
+    index[header] = i;
+  });
+
+  return index;
+}
+
+function blRequireHeaders_(headers, required, sheetName) {
+  const missing = required.filter(function(header) {
+    return headers.indexOf(header) === -1;
+  });
+
+  if (missing.length) {
+    throw new Error(
+      sheetName + 'に必須列がありません: ' + missing.join(', ')
+    );
+  }
+}
+
+function blInDateRange_(dateText, start, end) {
+  return dateText >= start && dateText <= end;
+}
+
+function blNormalizeDateText_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  }
+
+  const text = String(value || '').trim();
+  const match = text.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+
+  if (!match) {
+    return '';
+  }
+
+  return [
+    match[1],
+    ('0' + match[2]).slice(-2),
+    ('0' + match[3]).slice(-2)
+  ].join('-');
+}
+
+function blToBoolean_(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const text = String(value || '').trim().toLowerCase();
+
+  return (
+    text === 'true' ||
+    text === '1' ||
+    text === 'yes' ||
+    text === 'y'
+  );
+}
+
+function blToInt_(value) {
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function blClamp_(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
 

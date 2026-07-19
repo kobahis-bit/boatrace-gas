@@ -1,1 +1,700 @@
+/**
+ * ボートレースMC バックテスト履歴収集 GAS v0.1.0
+ *
+ * 目的:
+ * - 本番の朝MC / AppSheetとは完全分離
+ * - BoatRace OpenAPI 日付別履歴から、出走表・直前情報・結果を取得
+ * - 「朝に使える情報」「展示後に使える情報」「採点情報」を明確に分離
+ *
+ * 最初の対象:
+ * 2026-07-08 ～ 2026-07-14（7日分）
+ *
+ * データ元:
+ * https://boatraceopenapi.github.io/api/v1/YYYY/YYYYMMDD.json
+ */
+
+const BT_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+  API_BASE: 'https://boatraceopenapi.github.io/api/v1',
+  TIMEZONE: 'Asia/Tokyo',
+
+  START_DATE: '2026-07-08',
+  END_DATE: '2026-07-14',
+
+  SHEETS: Object.freeze({
+    RAW: 'Raw_Daily_Data',
+    RACE: 'Backtest_Race',
+    RACER: 'Backtest_Racer',
+    PARAMETER: 'Parameter_Test',
+    SUMMARY: 'Validation_Summary',
+    CALIBRATION: 'Calibration_Bins'
+  })
+});
+
+const STADIUM_NAMES = Object.freeze({
+  '1':'桐生','2':'戸田','3':'江戸川','4':'平和島','5':'多摩川','6':'浜名湖',
+  '7':'蒲郡','8':'常滑','9':'津','10':'三国','11':'びわこ','12':'住之江',
+  '13':'尼崎','14':'鳴門','15':'丸亀','16':'児島','17':'宮島','18':'徳山',
+  '19':'下関','20':'若松','21':'芦屋','22':'福岡','23':'唐津','24':'大村'
+});
+
+const RAW_HEADERS = Object.freeze([
+  '日付','Source_URL','HTTP_Status','会場数','レース数',
+  'Preview有','Result有','取得日時','Status','Error'
+]);
+
+const RACE_HEADERS = Object.freeze([
+  'Race_ID','日付','場コード','場','R','締切','グレード番号',
+  'タイトル','サブタイトル','距離','開催日数',
+
+  'Preview有','展示_風速','展示_風向番号','展示_波高','展示_天候番号',
+  '展示_気温','展示_水温',
+
+  'Result有','結果_風速','結果_風向番号','結果_波高','結果_天候番号',
+  '結果_気温','結果_水温','決まり手番号',
+
+  '1着艇','2着艇','3着艇',
+  '2連単組合せ','2連単払戻',
+  '2連複組合せ','2連複払戻',
+  '3連単組合せ','3連単払戻',
+  '3連複組合せ','3連複払戻',
+
+  '取得日時','Source_URL'
+]);
+
+const RACER_HEADERS = Object.freeze([
+  'Racer_Row_ID','Race_ID','日付','場コード','場','R','艇番',
+
+  // 朝モデルに使用可能
+  '選手名','選手番号','級別番号','支部番号','出身地番号','年齢','体重',
+  'F数','L数','平均ST',
+  '全国勝率','全国2連率','全国3連率',
+  '当地勝率','当地2連率','当地3連率',
+  'モーター番号','モーター2連率','モーター3連率',
+  'ボート番号','ボート2連率','ボート3連率',
+
+  // 展示後モデルにのみ使用可能
+  '展示有','展示コース','展示ST','展示体重','展示調整体重',
+  '展示タイム','チルト',
+
+  // 採点専用。予測入力へ混ぜない
+  '結果有','本番コース','本番ST','着順','結果選手番号','結果選手名',
+
+  '取得日時'
+]);
+
+const PARAMETER_HEADERS = Object.freeze([
+  'Test_ID','期間区分','開始日','終了日','モデル名',
+  'Noise_SD','Venue_Weight','Correlation_Mode','MC_Trials',
+  '対象レース数','Top1_Accuracy','Brier_Score','Log_Loss',
+  '1号艇_Brier','Best_Exacta_Accuracy','Best_Quinella_Accuracy',
+  '作成日時','Memo'
+]);
+
+const SUMMARY_HEADERS = Object.freeze([
+  '順位','Test_ID','モデル名','Noise_SD','Venue_Weight','Correlation_Mode',
+  '対象レース数','Top1_Accuracy','Brier_Score','Log_Loss',
+  '1号艇_Brier','採用候補','Memo'
+]);
+
+const CALIBRATION_HEADERS = Object.freeze([
+  'Test_ID','対象','確率帯下限','確率帯上限','件数',
+  '平均予測確率','実的中率','差分','作成日時'
+]);
+
+
+/**
+ * 最初に1回だけ実行。
+ * シート、見出し、基本書式を整えます。
+ */
+function setupBacktestWorkbook() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  ss.setSpreadsheetTimeZone(BT_CONFIG.TIMEZONE);
+
+  ensureSheet_(ss, BT_CONFIG.SHEETS.RAW, RAW_HEADERS);
+  ensureSheet_(ss, BT_CONFIG.SHEETS.RACE, RACE_HEADERS);
+  ensureSheet_(ss, BT_CONFIG.SHEETS.RACER, RACER_HEADERS);
+  ensureSheet_(ss, BT_CONFIG.SHEETS.PARAMETER, PARAMETER_HEADERS);
+  ensureSheet_(ss, BT_CONFIG.SHEETS.SUMMARY, SUMMARY_HEADERS);
+  ensureSheet_(ss, BT_CONFIG.SHEETS.CALIBRATION, CALIBRATION_HEADERS);
+
+  formatBacktestSheets_(ss);
+  console.log('バックテストWorkbookの準備が完了しました。');
+}
+
+
+/**
+ * 7日分を一括取得。
+ * 同一IDが既に存在する行は追加しません。
+ */
+function importInitial7Days() {
+  return importHistoryRange(BT_CONFIG.START_DATE, BT_CONFIG.END_DATE);
+}
+
+
+/**
+ * 任意期間を取得。
+ * 例:
+ * importHistoryRange('2026-07-01', '2026-07-14')
+ */
+function importHistoryRange(startDateText, endDateText) {
+  setupBacktestWorkbook();
+
+  const dates = buildDateRange_(startDateText, endDateText);
+  if (!dates.length) throw new Error('日付範囲が空です。');
+
+  const requests = dates.map(function(dateText) {
+    return {
+      url: buildHistoryUrl_(dateText),
+      method: 'get',
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'BoatRaceBacktest/0.1.0'
+      }
+    };
+  });
+
+  const responses = UrlFetchApp.fetchAll(requests);
+
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const rawSheet = ss.getSheetByName(BT_CONFIG.SHEETS.RAW);
+  const raceSheet = ss.getSheetByName(BT_CONFIG.SHEETS.RACE);
+  const racerSheet = ss.getSheetByName(BT_CONFIG.SHEETS.RACER);
+
+  const existingRaceIds = getExistingIdSet_(raceSheet, 1);
+  const existingRacerIds = getExistingIdSet_(racerSheet, 1);
+
+  const rawRows = [];
+  const raceRows = [];
+  const racerRows = [];
+
+  const summary = {
+    requestedDays: dates.length,
+    successDays: 0,
+    errorDays: 0,
+    extractedRaces: 0,
+    insertedRaces: 0,
+    insertedRacers: 0,
+    skippedRaces: 0,
+    skippedRacers: 0,
+    errors: []
+  };
+
+  responses.forEach(function(response, index) {
+    const dateText = dates[index];
+    const url = requests[index].url;
+    const status = response.getResponseCode();
+    const fetchedAt = new Date();
+
+    if (status < 200 || status >= 300) {
+      const errorText = 'HTTP ' + status;
+      rawRows.push([
+        dateText, url, status, 0, 0, 0, 0, fetchedAt, 'ERROR', errorText
+      ]);
+      summary.errorDays++;
+      summary.errors.push(dateText + ': ' + errorText);
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(response.getContentText('UTF-8'));
+      const flattened = flattenDailyPayload_(payload, url, fetchedAt);
+
+      rawRows.push([
+        dateText,
+        url,
+        status,
+        flattened.stadiumCount,
+        flattened.raceRows.length,
+        flattened.previewCount,
+        flattened.resultCount,
+        fetchedAt,
+        'OK',
+        ''
+      ]);
+
+      summary.successDays++;
+      summary.extractedRaces += flattened.raceRows.length;
+
+      flattened.raceRows.forEach(function(row) {
+        const id = String(row[0]);
+        if (existingRaceIds.has(id)) {
+          summary.skippedRaces++;
+          return;
+        }
+        existingRaceIds.add(id);
+        raceRows.push(row);
+        summary.insertedRaces++;
+      });
+
+      flattened.racerRows.forEach(function(row) {
+        const id = String(row[0]);
+        if (existingRacerIds.has(id)) {
+          summary.skippedRacers++;
+          return;
+        }
+        existingRacerIds.add(id);
+        racerRows.push(row);
+        summary.insertedRacers++;
+      });
+
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      rawRows.push([
+        dateText, url, status, 0, 0, 0, 0, fetchedAt, 'ERROR', message
+      ]);
+      summary.errorDays++;
+      summary.errors.push(dateText + ': ' + message);
+    }
+  });
+
+  appendRows_(rawSheet, rawRows);
+  appendRows_(raceSheet, raceRows);
+  appendRows_(racerSheet, racerRows);
+
+  SpreadsheetApp.flush();
+  console.log(JSON.stringify(summary, null, 2));
+  return summary;
+}
+
+
+/**
+ * 取得済みデータを消してやり直す場合だけ使用。
+ * 見出し・書式は残します。
+ */
+function clearImportedBacktestData() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+
+  [
+    BT_CONFIG.SHEETS.RAW,
+    BT_CONFIG.SHEETS.RACE,
+    BT_CONFIG.SHEETS.RACER,
+    BT_CONFIG.SHEETS.PARAMETER,
+    BT_CONFIG.SHEETS.SUMMARY,
+    BT_CONFIG.SHEETS.CALIBRATION
+  ].forEach(function(name) {
+    const sheet = ss.getSheetByName(name);
+    if (!sheet) return;
+    const lastRow = sheet.getLastRow();
+    const lastColumn = sheet.getLastColumn();
+    if (lastRow > 1 && lastColumn > 0) {
+      sheet.getRange(2, 1, lastRow - 1, lastColumn).clearContent();
+    }
+  });
+
+  console.log('バックテストデータをクリアしました。');
+}
+
+
+/**
+ * 取得済みデータの基本品質を確認。
+ */
+function validateImportedBacktestData() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const raceSheet = ss.getSheetByName(BT_CONFIG.SHEETS.RACE);
+  const racerSheet = ss.getSheetByName(BT_CONFIG.SHEETS.RACER);
+
+  const raceLast = raceSheet.getLastRow();
+  const racerLast = racerSheet.getLastRow();
+
+  const result = {
+    raceRows: Math.max(raceLast - 1, 0),
+    racerRows: Math.max(racerLast - 1, 0),
+    expectedRacerRows: Math.max(raceLast - 1, 0) * 6,
+    racerCountMatches: Math.max(racerLast - 1, 0) === Math.max(raceLast - 1, 0) * 6,
+    duplicateRaceIds: countDuplicateIds_(raceSheet, 1),
+    duplicateRacerIds: countDuplicateIds_(racerSheet, 1)
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+
+function flattenDailyPayload_(payload, sourceUrl, fetchedAt) {
+  const stadiums =
+    payload &&
+    payload.programs &&
+    payload.programs.stadiums &&
+    typeof payload.programs.stadiums === 'object'
+      ? payload.programs.stadiums
+      : {};
+
+  const raceRows = [];
+  const racerRows = [];
+  let previewCount = 0;
+  let resultCount = 0;
+
+  Object.keys(stadiums).forEach(function(stadiumKey) {
+    const stadium = stadiums[stadiumKey] || {};
+    const races =
+      stadium.races && typeof stadium.races === 'object'
+        ? stadium.races
+        : {};
+
+    Object.keys(races).forEach(function(raceKey) {
+      const race = races[raceKey] || {};
+      const dateText = normalizeDateText_(race.date);
+      const stadiumNumber = String(firstValue_(race.stadium_number, stadiumKey));
+      const raceNumber = Number(firstValue_(race.race_number, raceKey));
+      const stadiumName = STADIUM_NAMES[stadiumNumber] || ('場' + stadiumNumber);
+      const raceId =
+        dateText.replace(/-/g, '') + '_' + stadiumName + raceNumber + 'R';
+
+      const preview = race.preview || null;
+      const result = race.result || null;
+
+      if (preview) previewCount++;
+      if (result) resultCount++;
+
+      const resultPlaces = extractResultPlaces_(result);
+      const payouts = result && result.payouts ? result.payouts : {};
+
+      raceRows.push([
+        raceId,
+        dateText,
+        pad2_(stadiumNumber),
+        stadiumName,
+        raceNumber,
+        normalizeDeadlineText_(race.closed_at),
+        numberOrBlank_(race.grade_number),
+        textOrBlank_(race.title),
+        textOrBlank_(race.subtitle),
+        numberOrBlank_(race.distance),
+        numberOrBlank_(race.day_number),
+
+        Boolean(preview),
+        preview ? numberOrBlank_(preview.wind_speed) : '',
+        preview ? numberOrBlank_(preview.wind_direction_number) : '',
+        preview ? numberOrBlank_(preview.wave_height) : '',
+        preview ? numberOrBlank_(preview.weather_number) : '',
+        preview ? numberOrBlank_(preview.air_temperature) : '',
+        preview ? numberOrBlank_(preview.water_temperature) : '',
+
+        Boolean(result),
+        result ? numberOrBlank_(result.wind_speed) : '',
+        result ? numberOrBlank_(result.wind_direction_number) : '',
+        result ? numberOrBlank_(result.wave_height) : '',
+        result ? numberOrBlank_(result.weather_number) : '',
+        result ? numberOrBlank_(result.air_temperature) : '',
+        result ? numberOrBlank_(result.water_temperature) : '',
+        result ? numberOrBlank_(result.technique_number) : '',
+
+        resultPlaces[1] || '',
+        resultPlaces[2] || '',
+        resultPlaces[3] || '',
+
+        firstPayoutCombination_(payouts, 'exacta'),
+        firstPayoutAmount_(payouts, 'exacta'),
+        firstPayoutCombination_(payouts, 'quinella'),
+        firstPayoutAmount_(payouts, 'quinella'),
+        firstPayoutCombination_(payouts, 'trifecta'),
+        firstPayoutAmount_(payouts, 'trifecta'),
+        firstPayoutCombination_(payouts, 'trio'),
+        firstPayoutAmount_(payouts, 'trio'),
+
+        fetchedAt,
+        sourceUrl
+      ]);
+
+      const baseRacers =
+        race.racers && typeof race.racers === 'object'
+          ? race.racers
+          : {};
+      const previewRacers =
+        preview && preview.racers && typeof preview.racers === 'object'
+          ? preview.racers
+          : {};
+      const resultRacers =
+        result && result.racers && typeof result.racers === 'object'
+          ? result.racers
+          : {};
+
+      for (let entry = 1; entry <= 6; entry++) {
+        const key = String(entry);
+        const base = baseRacers[key] || {};
+        const pre = previewRacers[key] || {};
+        const res = resultRacers[key] || {};
+
+        racerRows.push([
+          raceId + '_' + entry,
+          raceId,
+          dateText,
+          pad2_(stadiumNumber),
+          stadiumName,
+          raceNumber,
+          entry,
+
+          textOrBlank_(base.name),
+          numberOrBlank_(base.number),
+          numberOrBlank_(base.rank_number),
+          numberOrBlank_(base.branch_number),
+          numberOrBlank_(base.birthplace_number),
+          numberOrBlank_(base.age),
+          numberOrBlank_(base.weight),
+          numberOrBlank_(base.flying_count),
+          numberOrBlank_(base.late_count),
+          numberOrBlank_(base.average_start_timing),
+          numberOrBlank_(base.national_win_rate),
+          percentToDecimal_(base.national_top_2_percent),
+          percentToDecimal_(base.national_top_3_percent),
+          numberOrBlank_(base.local_win_rate),
+          percentToDecimal_(base.local_top_2_percent),
+          percentToDecimal_(base.local_top_3_percent),
+          numberOrBlank_(base.motor_number),
+          percentToDecimal_(base.motor_top_2_percent),
+          percentToDecimal_(base.motor_top_3_percent),
+          numberOrBlank_(base.boat_number),
+          percentToDecimal_(base.boat_top_2_percent),
+          percentToDecimal_(base.boat_top_3_percent),
+
+          Boolean(Object.keys(pre).length),
+          numberOrBlank_(pre.course_number),
+          numberOrBlank_(pre.start_timing),
+          numberOrBlank_(pre.weight),
+          numberOrBlank_(pre.weight_adjustment),
+          numberOrBlank_(pre.exhibition_time),
+          numberOrBlank_(pre.tilt_adjustment),
+
+          Boolean(Object.keys(res).length),
+          numberOrBlank_(res.course_number),
+          numberOrBlank_(res.start_timing),
+          numberOrBlank_(res.place_number),
+          numberOrBlank_(res.number),
+          textOrBlank_(res.name),
+
+          fetchedAt
+        ]);
+      }
+    });
+  });
+
+  return {
+    stadiumCount: Object.keys(stadiums).length,
+    raceRows: raceRows,
+    racerRows: racerRows,
+    previewCount: previewCount,
+    resultCount: resultCount
+  };
+}
+
+
+function ensureSheet_(ss, name, headers) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(
+      sheet.getMaxColumns(),
+      headers.length - sheet.getMaxColumns()
+    );
+  }
+
+  const currentHeaders = sheet
+    .getRange(1, 1, 1, headers.length)
+    .getDisplayValues()[0];
+
+  const differs = headers.some(function(header, i) {
+    return String(currentHeaders[i] || '') !== String(header);
+  });
+
+  if (differs) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+
+function formatBacktestSheets_(ss) {
+  const raw = ss.getSheetByName(BT_CONFIG.SHEETS.RAW);
+  const race = ss.getSheetByName(BT_CONFIG.SHEETS.RACE);
+  const racer = ss.getSheetByName(BT_CONFIG.SHEETS.RACER);
+
+  [raw, race, racer].forEach(function(sheet) {
+    const lastCol = sheet.getLastColumn();
+    sheet.getRange(1, 1, 1, lastCol)
+      .setFontWeight('bold')
+      .setBackground('#d9eaf7')
+      .setWrap(true);
+    sheet.autoResizeColumns(1, Math.min(lastCol, 12));
+  });
+
+  race.getRange('A2:F').setNumberFormat('@');
+  race.getRange('AM2:AM').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+
+  racer.getRange('A2:G').setNumberFormat('@');
+  racer.getRange('S2:U').setNumberFormat('0.0%');
+  racer.getRange('V2:X').setNumberFormat('0.0%');
+  racer.getRange('Z2:AA').setNumberFormat('0.0%');
+  racer.getRange('AC2:AD').setNumberFormat('0.0%');
+  racer.getRange('AQ2:AQ').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+}
+
+
+function appendRows_(sheet, rows) {
+  if (!rows || !rows.length) return;
+  const startRow = findLastDataRow_(sheet, 1) + 1;
+  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+
+function findLastDataRow_(sheet, idColumn) {
+  const lastPhysicalRow = sheet.getLastRow();
+  if (lastPhysicalRow <= 1) return 1;
+
+  const values = sheet
+    .getRange(2, idColumn, lastPhysicalRow - 1, 1)
+    .getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim() !== '') return i + 2;
+  }
+  return 1;
+}
+
+
+function getExistingIdSet_(sheet, idColumn) {
+  const lastRow = findLastDataRow_(sheet, idColumn);
+  const set = new Set();
+  if (lastRow <= 1) return set;
+
+  sheet.getRange(2, idColumn, lastRow - 1, 1)
+    .getDisplayValues()
+    .forEach(function(row) {
+      const id = String(row[0] || '').trim();
+      if (id) set.add(id);
+    });
+  return set;
+}
+
+
+function countDuplicateIds_(sheet, idColumn) {
+  const lastRow = findLastDataRow_(sheet, idColumn);
+  if (lastRow <= 1) return 0;
+
+  const seen = new Set();
+  let duplicates = 0;
+
+  sheet.getRange(2, idColumn, lastRow - 1, 1)
+    .getDisplayValues()
+    .forEach(function(row) {
+      const id = String(row[0] || '').trim();
+      if (!id) return;
+      if (seen.has(id)) duplicates++;
+      else seen.add(id);
+    });
+
+  return duplicates;
+}
+
+
+function extractResultPlaces_(result) {
+  const places = {};
+  if (!result || !result.racers) return places;
+
+  Object.keys(result.racers).forEach(function(entryKey) {
+    const racer = result.racers[entryKey] || {};
+    const place = Number(racer.place_number);
+    if (place >= 1 && place <= 3) {
+      places[place] = Number(firstValue_(racer.entry_number, entryKey));
+    }
+  });
+
+  return places;
+}
+
+
+function firstPayoutCombination_(payouts, type) {
+  const items = payouts && Array.isArray(payouts[type]) ? payouts[type] : [];
+  return items.length ? textOrBlank_(items[0].combination) : '';
+}
+
+
+function firstPayoutAmount_(payouts, type) {
+  const items = payouts && Array.isArray(payouts[type]) ? payouts[type] : [];
+  return items.length ? numberOrBlank_(items[0].amount) : '';
+}
+
+
+function buildHistoryUrl_(dateText) {
+  const compact = String(dateText).replace(/-/g, '');
+  const year = compact.slice(0, 4);
+  return BT_CONFIG.API_BASE + '/' + year + '/' + compact + '.json';
+}
+
+
+function buildDateRange_(startText, endText) {
+  const start = parseDateText_(startText);
+  const end = parseDateText_(endText);
+  if (start > end) throw new Error('開始日が終了日より後です。');
+
+  const dates = [];
+  const cursor = new Date(start.getTime());
+
+  while (cursor <= end) {
+    dates.push(Utilities.formatDate(cursor, BT_CONFIG.TIMEZONE, 'yyyy-MM-dd'));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return dates;
+}
+
+
+function parseDateText_(text) {
+  const m = String(text || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error('日付はYYYY-MM-DD形式で指定してください: ' + text);
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12, 0, 0);
+}
+
+
+function normalizeDateText_(value) {
+  const s = String(value || '').trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? m[1] + '-' + m[2] + '-' + m[3] : s;
+}
+
+
+function normalizeDeadlineText_(value) {
+  const s = String(value || '').trim();
+  const m = s.match(/(\d{1,2}):(\d{2})/);
+  return m ? ('0' + m[1]).slice(-2) + ':' + m[2] : '';
+}
+
+
+function percentToDecimal_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '';
+  return Math.abs(number) > 1 ? number / 100 : number;
+}
+
+
+function numberOrBlank_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const number = Number(value);
+  return Number.isFinite(number) ? number : '';
+}
+
+
+function textOrBlank_(value) {
+  return value === null || value === undefined ? '' : String(value);
+}
+
+
+function firstValue_() {
+  for (let i = 0; i < arguments.length; i++) {
+    const value = arguments[i];
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return '';
+}
+
+
+function pad2_(value) {
+  return ('0' + String(value || '')).slice(-2);
+}
 

@@ -1,1 +1,769 @@
+/**
+ * BoatRace Backtest Data Importer v1.0.1 (名前衝突回避版)
+ * 2026年5月・6月データ取得版
+ * ------------------------------------------------------------
+ * 既存シートだけを使用します。
+ *   Raw_Daily_Data / Backtest_Race / Backtest_Racer
+ *
+ * 実行順:
+ *   1. btiSetupBacktestImportFormat()
+ *   2. btiImportBacktestSingleDate('2026-05-01')
+ *   3. btiStartImportMayJune2026()
+ *
+ * 進捗確認:
+ *   btiCheckBacktestImportStatus()
+ *
+ * 1日だけ試す場合:
+ *   btiImportBacktestSingleDate('2026-05-01')
+ */
+
+const BTI_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+  RAW_SHEET: 'Raw_Daily_Data',
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  API_BASE_URL: 'https://boatraceopenapi.github.io/api/v1',
+  TIMEZONE: 'Asia/Tokyo',
+  START_DATE: '2026-05-01',
+  END_DATE: '2026-06-30',
+  DAYS_PER_RUN: 2,
+  NEXT_TRIGGER_AFTER_MINUTES: 1,
+  REQUEST_SLEEP_MS: 150,
+  LOCK_TIMEOUT_MS: 30000,
+  PROP_CURRENT_DATE: 'BACKTEST_IMPORT_CURRENT_DATE',
+  PROP_END_DATE: 'BACKTEST_IMPORT_END_DATE',
+  PROP_STATUS: 'BACKTEST_IMPORT_STATUS',
+  PROP_LAST_MESSAGE: 'BACKTEST_IMPORT_LAST_MESSAGE',
+  STATUS_IDLE: 'IDLE',
+  STATUS_RUNNING: 'RUNNING',
+  STATUS_COMPLETED: 'COMPLETED',
+  STATUS_STOPPED: 'STOPPED',
+  STATUS_FAILED: 'FAILED',
+  TRIGGER_FUNCTION: 'btiRunBacktestImportBatch'
+});
+
+const BTI_RAW_HEADERS = Object.freeze([
+  '日付','Source_URL','HTTP_Status','会場数','レース数',
+  'Preview有','Result有','取得日時','Status','Error'
+]);
+
+const BTI_RACE_HEADERS = Object.freeze([
+  'Race_ID','日付','場コード','場','R','締切','グレード番号','タイトル','サブタイトル','距離','開催日数',
+  'Preview有','展示_風速','展示_風向番号','展示_波高','展示_天候番号','展示_気温','展示_水温',
+  'Result有','結果_風速','結果_風向番号','結果_波高','結果_天候番号','結果_気温','結果_水温','決まり手番号',
+  '1着艇','2着艇','3着艇','2連単組合せ','2連単払戻','2連複組合せ','2連複払戻',
+  '3連単組合せ','3連単払戻','3連複組合せ','3連複払戻','取得日時','Source_URL'
+]);
+
+const BTI_RACER_HEADERS = Object.freeze([
+  'Racer_Row_ID','Race_ID','日付','場コード','場','R','艇番','選手名','選手番号','級別番号','支部番号','出身地番号',
+  '年齢','体重','F数','L数','平均ST','全国勝率','全国2連率','全国3連率','当地勝率','当地2連率','当地3連率',
+  'モーター番号','モーター2連率','モーター3連率','ボート番号','ボート2連率','ボート3連率',
+  '展示有','展示コース','展示ST','展示体重','展示調整体重','展示タイム','チルト',
+  '結果有','本番コース','本番ST','着順','結果選手番号','結果選手名','取得日時'
+]);
+
+const BTI_VENUE_NAMES = Object.freeze({
+  '01':'桐生','02':'戸田','03':'江戸川','04':'平和島','05':'多摩川','06':'浜名湖',
+  '07':'蒲郡','08':'常滑','09':'津','10':'三国','11':'びわこ','12':'住之江',
+  '13':'尼崎','14':'鳴門','15':'丸亀','16':'児島','17':'宮島','18':'徳山',
+  '19':'下関','20':'若松','21':'芦屋','22':'福岡','23':'唐津','24':'大村'
+});
+
+function btiSetupBacktestImportFormat() {
+  const ss = SpreadsheetApp.openById(BTI_CONFIG.SPREADSHEET_ID);
+  const rawSheet = btiRequireSheet_(ss, BTI_CONFIG.RAW_SHEET);
+  const raceSheet = btiRequireSheet_(ss, BTI_CONFIG.RACE_SHEET);
+  const racerSheet = btiRequireSheet_(ss, BTI_CONFIG.RACER_SHEET);
+
+  btiVerifyHeaders_(rawSheet, BTI_RAW_HEADERS);
+  btiVerifyHeaders_(raceSheet, BTI_RACE_HEADERS);
+  btiVerifyHeaders_(racerSheet, BTI_RACER_HEADERS);
+
+  const rawMaxRows = Math.max(rawSheet.getMaxRows(), 2);
+  const raceMaxRows = Math.max(raceSheet.getMaxRows(), 2);
+  const racerMaxRows = Math.max(racerSheet.getMaxRows(), 2);
+
+  rawSheet.getRange('A2:A' + rawMaxRows).setNumberFormat('yyyy-mm-dd');
+  rawSheet.getRange('B2:B' + rawMaxRows).setNumberFormat('@');
+  rawSheet.getRange('H2:H' + rawMaxRows).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  rawSheet.getRange('I2:J' + rawMaxRows).setNumberFormat('@');
+
+  raceSheet.getRange('A2:A' + raceMaxRows).setNumberFormat('@');
+  raceSheet.getRange('B2:B' + raceMaxRows).setNumberFormat('yyyy-mm-dd');
+  raceSheet.getRange('C2:D' + raceMaxRows).setNumberFormat('@');
+  raceSheet.getRange('F2:F' + raceMaxRows).setNumberFormat('@');
+  ['AD','AF','AH','AJ'].forEach(function(column) {
+    raceSheet.getRange(column + '2:' + column + raceMaxRows).setNumberFormat('@');
+  });
+  raceSheet.getRange('AL2:AL' + raceMaxRows).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  raceSheet.getRange('AM2:AM' + raceMaxRows).setNumberFormat('@');
+
+  racerSheet.getRange('A2:B' + racerMaxRows).setNumberFormat('@');
+  racerSheet.getRange('C2:C' + racerMaxRows).setNumberFormat('yyyy-mm-dd');
+  racerSheet.getRange('D2:E' + racerMaxRows).setNumberFormat('@');
+  racerSheet.getRange('H2:I' + racerMaxRows).setNumberFormat('@');
+  racerSheet.getRange('Q2:Q' + racerMaxRows).setNumberFormat('0.00');
+  racerSheet.getRange('S2:T' + racerMaxRows).setNumberFormat('0.0%');
+  racerSheet.getRange('V2:W' + racerMaxRows).setNumberFormat('0.0%');
+  racerSheet.getRange('Y2:Z' + racerMaxRows).setNumberFormat('0.0%');
+  racerSheet.getRange('AB2:AC' + racerMaxRows).setNumberFormat('0.0%');
+  racerSheet.getRange('AQ2:AQ' + racerMaxRows).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+
+  SpreadsheetApp.flush();
+  console.log('バックテスト用シートのヘッダーと書式を確認しました。');
+}
+
+function btiStartImportMayJune2026() {
+  btiStartBacktestImport_(BTI_CONFIG.START_DATE, BTI_CONFIG.END_DATE);
+}
+
+function btiStartBacktestImport(startDateText, endDateText) {
+  btiStartBacktestImport_(startDateText, endDateText);
+}
+
+function btiStartBacktestImport_(startDateText, endDateText) {
+  const startDate = btiParseDateText_(startDateText);
+  const endDate = btiParseDateText_(endDateText);
+
+  if (startDate.getTime() > endDate.getTime()) {
+    throw new Error('開始日が終了日より後です。');
+  }
+
+  btiSetupBacktestImportFormat();
+  btiDeleteImportTriggers_();
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    [BTI_CONFIG.PROP_CURRENT_DATE]: btiFormatDate_(startDate),
+    [BTI_CONFIG.PROP_END_DATE]: btiFormatDate_(endDate),
+    [BTI_CONFIG.PROP_STATUS]: BTI_CONFIG.STATUS_RUNNING,
+    [BTI_CONFIG.PROP_LAST_MESSAGE]: '取得開始: ' + btiFormatDate_(startDate) + '〜' + btiFormatDate_(endDate)
+  }, true);
+
+  btiRunBacktestImportBatch();
+}
+
+function btiRunBacktestImportBatch() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(BTI_CONFIG.LOCK_TIMEOUT_MS);
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const status = props.getProperty(BTI_CONFIG.PROP_STATUS);
+
+    if (status !== BTI_CONFIG.STATUS_RUNNING) {
+      btiDeleteImportTriggers_();
+      return btiCheckBacktestImportStatus();
+    }
+
+    const currentText = props.getProperty(BTI_CONFIG.PROP_CURRENT_DATE);
+    const endText = props.getProperty(BTI_CONFIG.PROP_END_DATE);
+
+    if (!currentText || !endText) {
+      throw new Error('取得期間の状態情報がありません。');
+    }
+
+    let currentDate = btiParseDateText_(currentText);
+    const endDate = btiParseDateText_(endText);
+    const processed = [];
+
+    for (let count = 0;
+         count < BTI_CONFIG.DAYS_PER_RUN && currentDate.getTime() <= endDate.getTime();
+         count++) {
+      const dateText = btiFormatDate_(currentDate);
+
+      try {
+        processed.push(btiImportBacktestDate_(dateText));
+      } catch (err) {
+        props.setProperty(BTI_CONFIG.PROP_STATUS, BTI_CONFIG.STATUS_FAILED);
+        props.setProperty(BTI_CONFIG.PROP_LAST_MESSAGE, dateText + ' 取得失敗: ' + err.message);
+        btiDeleteImportTriggers_();
+        throw err;
+      }
+
+      currentDate = btiAddDays_(currentDate, 1);
+      props.setProperty(BTI_CONFIG.PROP_CURRENT_DATE, btiFormatDate_(currentDate));
+      Utilities.sleep(BTI_CONFIG.REQUEST_SLEEP_MS);
+    }
+
+    if (currentDate.getTime() > endDate.getTime()) {
+      props.setProperty(BTI_CONFIG.PROP_STATUS, BTI_CONFIG.STATUS_COMPLETED);
+      props.setProperty(BTI_CONFIG.PROP_LAST_MESSAGE, '取得完了: ' + BTI_CONFIG.START_DATE + '〜' + endText);
+      btiDeleteImportTriggers_();
+      return {status: BTI_CONFIG.STATUS_COMPLETED, processed: processed};
+    }
+
+    props.setProperty(
+      BTI_CONFIG.PROP_LAST_MESSAGE,
+      '今回処理=' + processed.map(function(x){ return x.date; }).join(', ') + ' / 次回=' + btiFormatDate_(currentDate)
+    );
+
+    btiScheduleNextImportTrigger_();
+    return {
+      status: BTI_CONFIG.STATUS_RUNNING,
+      processed: processed,
+      nextDate: btiFormatDate_(currentDate),
+      endDate: btiFormatDate_(endDate)
+    };
+  } catch (err) {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty(BTI_CONFIG.PROP_STATUS) !== BTI_CONFIG.STATUS_FAILED) {
+      props.setProperty(BTI_CONFIG.PROP_STATUS, BTI_CONFIG.STATUS_FAILED);
+      props.setProperty(BTI_CONFIG.PROP_LAST_MESSAGE, err.message);
+    }
+    btiDeleteImportTriggers_();
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function btiImportBacktestSingleDate(dateText) {
+  btiSetupBacktestImportFormat();
+  return btiImportBacktestDate_(dateText);
+}
+
+function btiStopBacktestImport() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(BTI_CONFIG.PROP_STATUS, BTI_CONFIG.STATUS_STOPPED);
+  props.setProperty(BTI_CONFIG.PROP_LAST_MESSAGE, 'ユーザー操作により停止');
+  btiDeleteImportTriggers_();
+  return btiCheckBacktestImportStatus();
+}
+
+function btiCheckBacktestImportStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const result = {
+    status: props.getProperty(BTI_CONFIG.PROP_STATUS) || BTI_CONFIG.STATUS_IDLE,
+    currentDate: props.getProperty(BTI_CONFIG.PROP_CURRENT_DATE) || '',
+    endDate: props.getProperty(BTI_CONFIG.PROP_END_DATE) || '',
+    lastMessage: props.getProperty(BTI_CONFIG.PROP_LAST_MESSAGE) || ''
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function btiImportBacktestDate_(dateText) {
+  const date = btiParseDateText_(dateText);
+  const compactDate = Utilities.formatDate(date, BTI_CONFIG.TIMEZONE, 'yyyyMMdd');
+  const year = Utilities.formatDate(date, BTI_CONFIG.TIMEZONE, 'yyyy');
+  const sourceUrl = BTI_CONFIG.API_BASE_URL + '/' + year + '/' + compactDate + '.json';
+  const fetchedAt = new Date();
+  let httpStatus = 0;
+
+  try {
+    const response = UrlFetchApp.fetch(sourceUrl, {
+      method: 'get',
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 BoatRaceBacktest/1.0.0'
+      }
+    });
+
+    httpStatus = response.getResponseCode();
+
+    if (httpStatus < 200 || httpStatus >= 300) {
+      const errorText = 'HTTP ' + httpStatus + ': ' + response.getContentText('UTF-8').slice(0, 300);
+      btiUpsertRawDailyRow_({
+        date: date, sourceUrl: sourceUrl, httpStatus: httpStatus,
+        venueCount: 0, raceCount: 0, previewCount: 0, resultCount: 0,
+        fetchedAt: fetchedAt, status: 'ERROR', error: errorText
+      });
+      throw new Error(dateText + ' API取得失敗 ' + errorText);
+    }
+
+    const payload = JSON.parse(response.getContentText('UTF-8'));
+    const normalized = btiNormalizeApiDate_(payload, sourceUrl, fetchedAt);
+
+    if (!normalized.raceRows.length) {
+      throw new Error(dateText + ' レースデータを抽出できませんでした。');
+    }
+
+    const ss = SpreadsheetApp.openById(BTI_CONFIG.SPREADSHEET_ID);
+    const raceSheet = btiRequireSheet_(ss, BTI_CONFIG.RACE_SHEET);
+    const racerSheet = btiRequireSheet_(ss, BTI_CONFIG.RACER_SHEET);
+
+    btiVerifyHeaders_(raceSheet, BTI_RACE_HEADERS);
+    btiVerifyHeaders_(racerSheet, BTI_RACER_HEADERS);
+
+    const raceResult = btiUpsertRowsByKey_(raceSheet, normalized.raceRows, 1, BTI_RACE_HEADERS.length);
+    const racerResult = btiUpsertRowsByKey_(racerSheet, normalized.racerRows, 1, BTI_RACER_HEADERS.length);
+
+    btiUpsertRawDailyRow_({
+      date: date,
+      sourceUrl: sourceUrl,
+      httpStatus: httpStatus,
+      venueCount: normalized.venueCount,
+      raceCount: normalized.raceRows.length,
+      previewCount: normalized.previewCount,
+      resultCount: normalized.resultCount,
+      fetchedAt: fetchedAt,
+      status: 'OK',
+      error: ''
+    });
+
+    SpreadsheetApp.flush();
+
+    const result = {
+      date: dateText,
+      venues: normalized.venueCount,
+      races: normalized.raceRows.length,
+      racers: normalized.racerRows.length,
+      previews: normalized.previewCount,
+      results: normalized.resultCount,
+      raceUpdated: raceResult.updated,
+      raceInserted: raceResult.inserted,
+      racerUpdated: racerResult.updated,
+      racerInserted: racerResult.inserted
+    };
+
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } catch (err) {
+    if (httpStatus === 0) {
+      btiUpsertRawDailyRow_({
+        date: date, sourceUrl: sourceUrl, httpStatus: httpStatus,
+        venueCount: 0, raceCount: 0, previewCount: 0, resultCount: 0,
+        fetchedAt: fetchedAt, status: 'ERROR', error: err.message
+      });
+    }
+    throw err;
+  }
+}
+
+function btiNormalizeApiDate_(payload, sourceUrl, fetchedAt) {
+  const stadiums = payload && payload.programs && payload.programs.stadiums &&
+    typeof payload.programs.stadiums === 'object'
+      ? payload.programs.stadiums : {};
+
+  const raceRows = [];
+  const racerRows = [];
+  const venueSet = new Set();
+  let previewCount = 0;
+  let resultCount = 0;
+
+  Object.keys(stadiums).forEach(function(stadiumKey) {
+    const stadium = stadiums[stadiumKey] || {};
+    const venueCode = btiNormalizeVenueCode_(stadiumKey);
+    const venueName = BTI_VENUE_NAMES[venueCode] || String(stadium.name || stadium.stadium_name || venueCode);
+    const races = stadium.races && typeof stadium.races === 'object' ? stadium.races : {};
+
+    Object.keys(races).forEach(function(raceKey) {
+      const race = races[raceKey] || {};
+      const raceNo = btiToInt_(btiFirstNonEmpty_(race.race_number, raceKey));
+      if (!raceNo) return;
+
+      const raceDate = btiParseApiDate_(btiFirstNonEmpty_(race.date, payload.date));
+      const raceId = Utilities.formatDate(raceDate, BTI_CONFIG.TIMEZONE, 'yyyyMMdd') +
+        '_' + venueName + raceNo + 'R';
+
+      const preview = race.preview && typeof race.preview === 'object' ? race.preview : null;
+      const result = race.result && typeof race.result === 'object' ? race.result : null;
+
+      if (preview) previewCount++;
+      if (result) resultCount++;
+      venueSet.add(venueCode);
+
+      const resultRacers = result && result.racers && typeof result.racers === 'object'
+        ? result.racers : {};
+      const finishByEntry = btiBuildFinishByEntry_(resultRacers);
+      const payouts = result && result.payouts && typeof result.payouts === 'object'
+        ? result.payouts : {};
+
+      const exactaPayout = btiFirstPayout_(payouts.exacta);
+      const quinellaPayout = btiFirstPayout_(payouts.quinella);
+      const trifectaPayout = btiFirstPayout_(payouts.trifecta);
+      const trioPayout = btiFirstPayout_(payouts.trio);
+
+      raceRows.push([
+        raceId,
+        raceDate,
+        venueCode,
+        venueName,
+        raceNo,
+        btiNormalizeTime_(btiFirstNonEmpty_(race.closed_at, '')),
+        btiToIntOrBlank_(race.grade_number),
+        String(race.title || ''),
+        String(race.subtitle || ''),
+        btiToIntOrBlank_(race.distance),
+        btiToIntOrBlank_(btiFirstNonEmpty_(race.day_number, race.day_number_source)),
+
+        Boolean(preview),
+        preview ? btiToNumberOrBlank_(preview.wind_speed) : '',
+        preview ? btiToIntOrBlank_(preview.wind_direction_number) : '',
+        preview ? btiToNumberOrBlank_(preview.wave_height) : '',
+        preview ? btiToIntOrBlank_(preview.weather_number) : '',
+        preview ? btiToNumberOrBlank_(preview.air_temperature) : '',
+        preview ? btiToNumberOrBlank_(preview.water_temperature) : '',
+
+        Boolean(result),
+        result ? btiToNumberOrBlank_(result.wind_speed) : '',
+        result ? btiToIntOrBlank_(result.wind_direction_number) : '',
+        result ? btiToNumberOrBlank_(result.wave_height) : '',
+        result ? btiToIntOrBlank_(result.weather_number) : '',
+        result ? btiToNumberOrBlank_(result.air_temperature) : '',
+        result ? btiToNumberOrBlank_(result.water_temperature) : '',
+        result ? btiToIntOrBlank_(result.technique_number) : '',
+
+        finishByEntry.first || '',
+        finishByEntry.second || '',
+        finishByEntry.third || '',
+
+        btiTextCombination_(exactaPayout.combination),
+        exactaPayout.amount,
+        btiTextCombination_(quinellaPayout.combination),
+        quinellaPayout.amount,
+        btiTextCombination_(trifectaPayout.combination),
+        trifectaPayout.amount,
+        btiTextCombination_(trioPayout.combination),
+        trioPayout.amount,
+
+        fetchedAt,
+        sourceUrl
+      ]);
+
+      const programRacers = race.racers && typeof race.racers === 'object' ? race.racers : {};
+      const previewRacers = preview && preview.racers && typeof preview.racers === 'object'
+        ? preview.racers : {};
+
+      for (let entry = 1; entry <= 6; entry++) {
+        const key = String(entry);
+        const racer = programRacers[key] || {};
+        const previewRacer = previewRacers[key] || {};
+        const resultRacer = resultRacers[key] || {};
+        const racerRowId = raceId + '_' + entry;
+
+        racerRows.push([
+          racerRowId,
+          raceId,
+          raceDate,
+          venueCode,
+          venueName,
+          raceNo,
+          entry,
+          String(racer.name || ''),
+          btiNormalizeRacerNumber_(racer.number),
+          btiToIntOrBlank_(racer.rank_number),
+          btiToIntOrBlank_(racer.branch_number),
+          btiToIntOrBlank_(racer.birthplace_number),
+          btiToIntOrBlank_(racer.age),
+          btiToNumberOrBlank_(racer.weight),
+          btiToIntOrBlank_(racer.flying_count),
+          btiToIntOrBlank_(racer.late_count),
+          btiToNumberOrBlank_(racer.average_start_timing),
+          btiToNumberOrBlank_(racer.national_win_rate),
+          btiNormalizePercentOrBlank_(racer.national_top_2_percent),
+          btiNormalizePercentOrBlank_(racer.national_top_3_percent),
+          btiToNumberOrBlank_(racer.local_win_rate),
+          btiNormalizePercentOrBlank_(racer.local_top_2_percent),
+          btiNormalizePercentOrBlank_(racer.local_top_3_percent),
+          btiToIntOrBlank_(racer.motor_number),
+          btiNormalizePercentOrBlank_(racer.motor_top_2_percent),
+          btiNormalizePercentOrBlank_(racer.motor_top_3_percent),
+          btiToIntOrBlank_(racer.boat_number),
+          btiNormalizePercentOrBlank_(racer.boat_top_2_percent),
+          btiNormalizePercentOrBlank_(racer.boat_top_3_percent),
+
+          Boolean(preview && Object.keys(previewRacer).length),
+          btiToIntOrBlank_(previewRacer.course_number),
+          btiToNumberOrBlank_(previewRacer.start_timing),
+          btiToNumberOrBlank_(previewRacer.weight),
+          btiToNumberOrBlank_(previewRacer.weight_adjustment),
+          btiToNumberOrBlank_(previewRacer.exhibition_time),
+          btiToNumberOrBlank_(previewRacer.tilt_adjustment),
+
+          Boolean(result && Object.keys(resultRacer).length),
+          btiToIntOrBlank_(resultRacer.course_number),
+          btiToNumberOrBlank_(resultRacer.start_timing),
+          btiToIntOrBlank_(resultRacer.place_number),
+          btiNormalizeRacerNumber_(resultRacer.number),
+          String(resultRacer.name || ''),
+          fetchedAt
+        ]);
+      }
+    });
+  });
+
+  return {
+    venueCount: venueSet.size,
+    raceRows: raceRows,
+    racerRows: racerRows,
+    previewCount: previewCount,
+    resultCount: resultCount
+  };
+}
+
+function btiUpsertRowsByKey_(sheet, rows, keyColumn, columnCount) {
+  if (!rows.length) return {updated: 0, inserted: 0};
+
+  const lastDataRow = btiFindLastDataRowByColumn_(sheet, keyColumn);
+  const existingMap = new Map();
+
+  if (lastDataRow >= 2) {
+    sheet.getRange(2, keyColumn, lastDataRow - 1, 1)
+      .getDisplayValues()
+      .forEach(function(row, index) {
+        const key = String(row[0] || '').trim();
+        if (key && !existingMap.has(key)) existingMap.set(key, index + 2);
+      });
+  }
+
+  const updates = [];
+  const inserts = [];
+
+  rows.forEach(function(row) {
+    const key = String(row[keyColumn - 1] || '').trim();
+    if (!key) throw new Error(sheet.getName() + ': 一意キーが空です。');
+
+    if (existingMap.has(key)) {
+      updates.push({rowNumber: existingMap.get(key), values: row});
+    } else {
+      inserts.push(row);
+    }
+  });
+
+  updates.forEach(function(item) {
+    sheet.getRange(item.rowNumber, 1, 1, columnCount).setValues([item.values]);
+  });
+
+  if (inserts.length) {
+    const startRow = btiFindLastDataRowByColumn_(sheet, keyColumn) + 1;
+    btiEnsureEnoughRows_(sheet, startRow + inserts.length - 1);
+    sheet.getRange(startRow, 1, inserts.length, columnCount).setValues(inserts);
+  }
+
+  return {updated: updates.length, inserted: inserts.length};
+}
+
+function btiUpsertRawDailyRow_(data) {
+  const ss = SpreadsheetApp.openById(BTI_CONFIG.SPREADSHEET_ID);
+  const sheet = btiRequireSheet_(ss, BTI_CONFIG.RAW_SHEET);
+  btiVerifyHeaders_(sheet, BTI_RAW_HEADERS);
+
+  const targetDate = Utilities.formatDate(data.date, BTI_CONFIG.TIMEZONE, 'yyyy-MM-dd');
+  const lastRow = btiFindLastDataRowByColumn_(sheet, 1);
+  let targetRow = 0;
+
+  if (lastRow >= 2) {
+    const values = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = 0; i < values.length; i++) {
+      if (btiNormalizeSheetDateText_(values[i][0]) === targetDate) {
+        targetRow = i + 2;
+        break;
+      }
+    }
+  }
+
+  const row = [
+    data.date,
+    String(data.sourceUrl || ''),
+    data.httpStatus,
+    data.venueCount,
+    data.raceCount,
+    data.previewCount,
+    data.resultCount,
+    data.fetchedAt,
+    String(data.status || ''),
+    String(data.error || '')
+  ];
+
+  if (targetRow) {
+    sheet.getRange(targetRow, 1, 1, BTI_RAW_HEADERS.length).setValues([row]);
+  } else {
+    const startRow = btiFindLastDataRowByColumn_(sheet, 1) + 1;
+    btiEnsureEnoughRows_(sheet, startRow);
+    sheet.getRange(startRow, 1, 1, BTI_RAW_HEADERS.length).setValues([row]);
+  }
+}
+
+function btiBuildFinishByEntry_(resultRacers) {
+  const output = {first: '', second: '', third: ''};
+  Object.keys(resultRacers || {}).forEach(function(key) {
+    const racer = resultRacers[key] || {};
+    const entry = btiToInt_(btiFirstNonEmpty_(racer.entry_number, key));
+    const place = btiToInt_(racer.place_number);
+    if (place === 1) output.first = entry;
+    if (place === 2) output.second = entry;
+    if (place === 3) output.third = entry;
+  });
+  return output;
+}
+
+function btiFirstPayout_(array) {
+  if (!Array.isArray(array) || !array.length) return {combination: '', amount: ''};
+  return {
+    combination: String(array[0].combination || ''),
+    amount: btiToIntOrBlank_(array[0].amount)
+  };
+}
+
+function btiTextCombination_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  return String(value).trim();
+}
+
+function btiScheduleNextImportTrigger_() {
+  btiDeleteImportTriggers_();
+  ScriptApp.newTrigger(BTI_CONFIG.TRIGGER_FUNCTION)
+    .timeBased()
+    .after(BTI_CONFIG.NEXT_TRIGGER_AFTER_MINUTES * 60 * 1000)
+    .create();
+}
+
+function btiDeleteImportTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === BTI_CONFIG.TRIGGER_FUNCTION) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+function btiRequireSheet_(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error('必要なシートがありません: ' + sheetName);
+  return sheet;
+}
+
+function btiVerifyHeaders_(sheet, expectedHeaders) {
+  const actual = sheet.getRange(1, 1, 1, expectedHeaders.length)
+    .getDisplayValues()[0]
+    .map(function(value) { return String(value || '').trim(); });
+
+  const mismatches = [];
+  expectedHeaders.forEach(function(header, index) {
+    if (actual[index] !== header) {
+      mismatches.push(btiColumnNumberToLetter_(index + 1) + '列:「' + actual[index] + '」→「' + header + '」');
+    }
+  });
+
+  if (mismatches.length) {
+    throw new Error(sheet.getName() + 'のヘッダー不一致: ' + mismatches.slice(0, 10).join(', '));
+  }
+}
+
+function btiEnsureEnoughRows_(sheet, requiredLastRow) {
+  const maxRows = sheet.getMaxRows();
+  if (requiredLastRow > maxRows) {
+    sheet.insertRowsAfter(maxRows, requiredLastRow - maxRows);
+  }
+}
+
+function btiFindLastDataRowByColumn_(sheet, column) {
+  const physicalLastRow = sheet.getLastRow();
+  if (physicalLastRow < 2) return 1;
+
+  const values = sheet.getRange(2, column, physicalLastRow - 1, 1).getDisplayValues();
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim() !== '') return i + 2;
+  }
+  return 1;
+}
+
+function btiParseDateText_(text) {
+  const match = String(text || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) throw new Error('日付はYYYY-MM-DD形式で指定してください: ' + text);
+
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  if (date.getFullYear() !== Number(match[1]) ||
+      date.getMonth() !== Number(match[2]) - 1 ||
+      date.getDate() !== Number(match[3])) {
+    throw new Error('不正な日付です: ' + text);
+  }
+  return date;
+}
+
+function btiParseApiDate_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
+  const text = String(value || '').trim();
+  const match = text.match(/(\d{4})[-\/]?(\d{1,2})[-\/]?(\d{1,2})/);
+  if (!match) throw new Error('APIの日付を解析できません: ' + value);
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function btiFormatDate_(date) {
+  return Utilities.formatDate(date, BTI_CONFIG.TIMEZONE, 'yyyy-MM-dd');
+}
+
+function btiAddDays_(date, days) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+}
+
+function btiNormalizeSheetDateText_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return btiFormatDate_(value);
+  const text = String(value || '').trim();
+  const match = text.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (!match) return text;
+  return [match[1], ('0' + match[2]).slice(-2), ('0' + match[3]).slice(-2)].join('-');
+}
+
+function btiNormalizeVenueCode_(value) {
+  const number = parseInt(value, 10);
+  if (!Number.isFinite(number)) return String(value || '').padStart(2, '0');
+  return String(number).padStart(2, '0');
+}
+
+function btiNormalizeTime_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, BTI_CONFIG.TIMEZONE, 'HH:mm');
+  }
+  const text = String(value || '').trim();
+  const match = text.match(/(\d{1,2}):(\d{2})/);
+  return match ? ('0' + match[1]).slice(-2) + ':' + match[2] : text;
+}
+
+function btiNormalizeRacerNumber_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  return String(value).replace(/\D/g, '').trim();
+}
+
+function btiNormalizePercentOrBlank_(value) {
+  const number = btiToNumberOrNaN_(value);
+  if (!Number.isFinite(number)) return '';
+  return number > 1.5 ? number / 100 : number;
+}
+
+function btiToNumberOrBlank_(value) {
+  const number = btiToNumberOrNaN_(value);
+  return Number.isFinite(number) ? number : '';
+}
+
+function btiToNumberOrNaN_(value) {
+  if (value === null || value === undefined || value === '') return NaN;
+  const normalized = String(value).replace('%', '').replace(/,/g, '').trim();
+  const number = Number(normalized);
+  return Number.isFinite(number) ? number : NaN;
+}
+
+function btiToIntOrBlank_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) ? number : '';
+}
+
+function btiToInt_(value) {
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function btiFirstNonEmpty_() {
+  for (let i = 0; i < arguments.length; i++) {
+    const value = arguments[i];
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return '';
+}
+
+function btiColumnNumberToLetter_(number) {
+  let value = number;
+  let result = '';
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    value = Math.floor((value - 1) / 26);
+  }
+  return result;
+}
 

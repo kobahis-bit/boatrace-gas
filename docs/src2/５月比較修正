@@ -1,1 +1,2903 @@
+/**
+ * BoatRace June Model Comparison v1.1.0
+ * Brier Score / Log Loss / 会場別比較 正式版
+ * ------------------------------------------------------------
+ * 比較対象（2026年6月・未見データ）:
+ *
+ * A: NO_VENUE
+ *    会場補正なし
+ *
+ * B: CURRENT_V1
+ *    現行VENUE_ADJUST
+ *
+ * C: SHRUNK_V2
+ *    2026年5月だけで生成した縮小済み会場補正候補
+ *
+ * 重要:
+ * - Cの係数作成に6月データは使用しない
+ * - 6月の方向一致/不一致を見てCの係数を選別しない
+ * - 3モデルで同じ乱数を使用し、Monte Carlo誤差を揃える
+ * - Brier ScoreとLog Lossを正式な採用判定に使用する
+ * - 全体比較に加えて会場別比較を出力する
+ * - 新しいシートは作成しない
+ * - 最終結果はParameter_Testの末尾へ追記する
+ *
+ * 主な実行関数:
+ *   1. btmStartJuneModelComparison()
+ *   2. btmCheckJuneModelComparisonStatus()
+ *
+ * 自動継続関数:
+ *   btmRunJuneModelComparisonBatch()
+ *
+ * 停止・再開:
+ *   btmStopJuneModelComparison()
+ *   btmResumeJuneModelComparison()
+ */
+
+const BTM_CONFIG = Object.freeze({
+  SPREADSHEET_ID:
+    '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  PARAMETER_SHEET: 'Parameter_Test',
+
+  TIMEZONE: 'Asia/Tokyo',
+
+  VALIDATION_START: '2026-06-01',
+  VALIDATION_END: '2026-06-30',
+
+  // 5月だけで作成した候補値のRun_ID
+  CANDIDATE_RUN_ID: '20260717_085314',
+
+  MC_TRIALS: 2000,
+  NOISE_SD: 18,
+  VENUE_WEIGHT: 0.35,
+  CORRELATION_MODE: 'fixed_cholesky_v1',
+
+  // GASタイムアウト回避。遅ければ50へ下げる。
+  RACES_PER_BATCH: 80,
+  NEXT_TRIGGER_MINUTES: 1,
+
+  MIN_PROBABILITY: 1e-12,
+
+  TRIGGER_FUNCTION:
+    'btmRunJuneModelComparisonBatch',
+
+  PROP_STATUS: 'BTM_STATUS',
+  PROP_INDEX: 'BTM_INDEX',
+  PROP_TOTAL: 'BTM_TOTAL',
+  PROP_MESSAGE: 'BTM_MESSAGE',
+  PROP_STARTED_AT: 'BTM_STARTED_AT',
+
+  PROP_A: 'BTM_AGG_A',
+  PROP_B: 'BTM_AGG_B',
+  PROP_C: 'BTM_AGG_C',
+
+  PROP_VENUE_A: 'BTM_VENUE_AGG_A',
+  PROP_VENUE_B: 'BTM_VENUE_AGG_B',
+  PROP_VENUE_C: 'BTM_VENUE_AGG_C',
+
+  STATUS_IDLE: 'IDLE',
+  STATUS_RUNNING: 'RUNNING',
+  STATUS_COMPLETED: 'COMPLETED',
+  STATUS_STOPPED: 'STOPPED',
+  STATUS_FAILED: 'FAILED'
+});
+
+const BTM_MODEL_NAMES = Object.freeze([
+  'A_NO_VENUE',
+  'B_CURRENT_V1',
+  'C_SHRUNK_V2'
+]);
+
+const BTM_CLASS_POINTS = Object.freeze({
+  A1: 8,
+  A2: 6,
+  B1: 3,
+  B2: 1
+});
+
+const BTM_CURRENT_ADJUST = Object.freeze({
+  '01': [-12, 0,  4,  8,  5,  2],
+  '02': [-18, 0, 10, 18, 14,  6],
+  '03': [-20, 0,  8, 16, 12,  8],
+  '04': [  0, 0,  0,  0,  0,  0],
+  '05': [ 10, 0, -4, -6, -8,-10],
+  '06': [  2, 0,  0,  2,  0,  0],
+  '07': [ 14, 0, -5, -8,-10,-12],
+  '08': [ 10, 0, -4, -6, -8,-10],
+  '09': [  4, 0,  0,  0,  0,  0],
+  '10': [ -8, 0,  4,  8,  6,  2],
+  '11': [ -6, 0,  6, 12,  8,  2],
+  '12': [  2, 0,  0,  2,  0,  0],
+  '13': [ 12, 0, -4, -8,-10,-12],
+  '14': [ 14, 0, -4, -6,-10,-12],
+  '15': [  6, 0,  0,  0,  0,  0],
+  '16': [ 16, 0, -6,-10,-12,-14],
+  '17': [ 20, 0, -8,-12,-16,-18],
+  '18': [ 18, 0, -6,-10,-12,-14],
+  '19': [  4, 0,  0,  0,  0,  0],
+  '20': [  0, 0,  4,  6,  4,  2],
+  '21': [ 16, 0, -6,-10,-12,-14],
+  '22': [ -8, 0,  6, 10,  8,  4],
+  '23': [ 10, 0, -4, -6, -8,-10],
+  '24': [ 24, 0, -8,-12,-16,-20]
+});
+
+const BTM_CORR_MATRIX = Object.freeze([
+  [ 1.000, -0.098,  0.000,  0.000,  0.000,  0.000],
+  [-0.098,  1.000, -0.340,  0.000,  0.000,  0.000],
+  [ 0.000, -0.340,  1.000,  0.000, -0.274,  0.000],
+  [ 0.000,  0.000,  0.000,  1.000,  0.000,  0.000],
+  [ 0.000,  0.000, -0.274,  0.000,  1.000,  0.041],
+  [ 0.000,  0.000,  0.000,  0.000,  0.041,  1.000]
+]);
+
+/**
+ * 比較を最初から開始する。
+ */
+function btmStartJuneModelComparison() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    btmDeleteTriggers_();
+
+    const dataset =
+      btmLoadValidationDataset_();
+
+    const candidate =
+      btmLoadCandidateAdjust_();
+
+    btmValidateCandidate_(candidate);
+
+    const props =
+      PropertiesService.getScriptProperties();
+
+    props.setProperties({
+      [BTM_CONFIG.PROP_STATUS]:
+        BTM_CONFIG.STATUS_RUNNING,
+
+      [BTM_CONFIG.PROP_INDEX]:
+        '0',
+
+      [BTM_CONFIG.PROP_TOTAL]:
+        String(dataset.length),
+
+      [BTM_CONFIG.PROP_MESSAGE]:
+        '6月未見データ比較を開始',
+
+      [BTM_CONFIG.PROP_STARTED_AT]:
+        new Date().toISOString(),
+
+      [BTM_CONFIG.PROP_A]:
+        JSON.stringify(
+          btmNewAggregate_()
+        ),
+
+      [BTM_CONFIG.PROP_B]:
+        JSON.stringify(
+          btmNewAggregate_()
+        ),
+
+      [BTM_CONFIG.PROP_C]:
+        JSON.stringify(
+          btmNewAggregate_()
+        ),
+
+      [BTM_CONFIG.PROP_VENUE_A]:
+        JSON.stringify({}),
+
+      [BTM_CONFIG.PROP_VENUE_B]:
+        JSON.stringify({}),
+
+      [BTM_CONFIG.PROP_VENUE_C]:
+        JSON.stringify({})
+    }, true);
+
+    const result = {
+      status:
+        BTM_CONFIG.STATUS_RUNNING,
+
+      totalValidRaces:
+        dataset.length,
+
+      mcTrials:
+        BTM_CONFIG.MC_TRIALS,
+
+      racesPerBatch:
+        BTM_CONFIG.RACES_PER_BATCH,
+
+      models:
+        BTM_MODEL_NAMES,
+
+      candidateRunId:
+        BTM_CONFIG.CANDIDATE_RUN_ID,
+
+      note:
+        'Cは5月候補値を全144セル使用。6月結果による選別なし。'
+    };
+
+    console.log(
+      JSON.stringify(result, null, 2)
+    );
+
+    return btmRunJuneModelComparisonBatch();
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 1バッチ分を処理し、
+ * 未完了なら次回トリガーを作る。
+ */
+function btmRunJuneModelComparisonBatch() {
+  const lock =
+    LockService.getScriptLock();
+
+  lock.waitLock(30000);
+
+  try {
+    const props =
+      PropertiesService.getScriptProperties();
+
+    const status =
+      props.getProperty(
+        BTM_CONFIG.PROP_STATUS
+      );
+
+    if (
+      status !==
+      BTM_CONFIG.STATUS_RUNNING
+    ) {
+      btmDeleteTriggers_();
+
+      return btmCheckJuneModelComparisonStatus();
+    }
+
+    const dataset =
+      btmLoadValidationDataset_();
+
+    const candidate =
+      btmLoadCandidateAdjust_();
+
+    const transform =
+      btmCholesky_(
+        BTM_CORR_MATRIX
+      );
+
+    let index = Number(
+      props.getProperty(
+        BTM_CONFIG.PROP_INDEX
+      ) || 0
+    );
+
+    const endIndex = Math.min(
+      index +
+        BTM_CONFIG.RACES_PER_BATCH,
+      dataset.length
+    );
+
+    const aggA =
+      btmReadAggregate_(
+        BTM_CONFIG.PROP_A
+      );
+
+    const aggB =
+      btmReadAggregate_(
+        BTM_CONFIG.PROP_B
+      );
+
+    const aggC =
+      btmReadAggregate_(
+        BTM_CONFIG.PROP_C
+      );
+
+    const venueAggA =
+      btmReadVenueAggregate_(
+        BTM_CONFIG.PROP_VENUE_A
+      );
+
+    const venueAggB =
+      btmReadVenueAggregate_(
+        BTM_CONFIG.PROP_VENUE_B
+      );
+
+    const venueAggC =
+      btmReadVenueAggregate_(
+        BTM_CONFIG.PROP_VENUE_C
+      );
+
+    for (
+      ;
+      index < endIndex;
+      index++
+    ) {
+      const race = dataset[index];
+
+      const baseWithoutVenue =
+        race.boats.map(
+          function(boat, i) {
+            return btmCalculateBaseScore_(
+              boat,
+              i + 1
+            );
+          }
+        );
+
+      const currentValues =
+        BTM_CURRENT_ADJUST[
+          race.venueCode
+        ] || [0, 0, 0, 0, 0, 0];
+
+      const candidateValues =
+        candidate[
+          race.venueCode
+        ] || [0, 0, 0, 0, 0, 0];
+
+      const scoreSets = [
+        baseWithoutVenue.slice(),
+
+        baseWithoutVenue.map(
+          function(score, i) {
+            return (
+              score +
+              currentValues[i] *
+                BTM_CONFIG.VENUE_WEIGHT
+            );
+          }
+        ),
+
+        baseWithoutVenue.map(
+          function(score, i) {
+            return (
+              score +
+              candidateValues[i] *
+                BTM_CONFIG.VENUE_WEIGHT
+            );
+          }
+        )
+      ];
+
+      const probabilitySets =
+        btmRunSharedMonteCarlo_(
+          scoreSets,
+          transform,
+          BTM_CONFIG.MC_TRIALS,
+          BTM_CONFIG.NOISE_SD,
+          race.raceId
+        );
+
+      btmUpdateAggregate_(
+        aggA,
+        probabilitySets[0],
+        race.firstLane
+      );
+
+      btmUpdateAggregate_(
+        aggB,
+        probabilitySets[1],
+        race.firstLane
+      );
+
+      btmUpdateAggregate_(
+        aggC,
+        probabilitySets[2],
+        race.firstLane
+      );
+
+      btmUpdateVenueAggregate_(
+        venueAggA,
+        race.venueCode,
+        race.venue,
+        probabilitySets[0],
+        race.firstLane
+      );
+
+      btmUpdateVenueAggregate_(
+        venueAggB,
+        race.venueCode,
+        race.venue,
+        probabilitySets[1],
+        race.firstLane
+      );
+
+      btmUpdateVenueAggregate_(
+        venueAggC,
+        race.venueCode,
+        race.venue,
+        probabilitySets[2],
+        race.firstLane
+      );
+    }
+
+    props.setProperties({
+      [BTM_CONFIG.PROP_INDEX]:
+        String(index),
+
+      [BTM_CONFIG.PROP_TOTAL]:
+        String(dataset.length),
+
+      [BTM_CONFIG.PROP_MESSAGE]:
+        '処理済み=' +
+        index +
+        '/' +
+        dataset.length,
+
+      [BTM_CONFIG.PROP_A]:
+        JSON.stringify(aggA),
+
+      [BTM_CONFIG.PROP_B]:
+        JSON.stringify(aggB),
+
+      [BTM_CONFIG.PROP_C]:
+        JSON.stringify(aggC),
+
+      [BTM_CONFIG.PROP_VENUE_A]:
+        JSON.stringify(venueAggA),
+
+      [BTM_CONFIG.PROP_VENUE_B]:
+        JSON.stringify(venueAggB),
+
+      [BTM_CONFIG.PROP_VENUE_C]:
+        JSON.stringify(venueAggC)
+    }, false);
+
+    if (index >= dataset.length) {
+      const report =
+        btmFinalizeComparison_(
+          aggA,
+          aggB,
+          aggC,
+          venueAggA,
+          venueAggB,
+          venueAggC
+        );
+
+      props.setProperty(
+        BTM_CONFIG.PROP_STATUS,
+        BTM_CONFIG.STATUS_COMPLETED
+      );
+
+      props.setProperty(
+        BTM_CONFIG.PROP_MESSAGE,
+        '比較完了'
+      );
+
+      btmDeleteTriggers_();
+
+      console.log(
+        JSON.stringify(report, null, 2)
+      );
+
+      return report;
+    }
+
+    btmScheduleNextTrigger_();
+
+    const result = {
+      status:
+        BTM_CONFIG.STATUS_RUNNING,
+
+      processed:
+        index,
+
+      total:
+        dataset.length,
+
+      progress:
+        dataset.length > 0
+          ? index / dataset.length
+          : 0,
+
+      nextBatchFrom:
+        index
+    };
+
+    console.log(
+      JSON.stringify(result, null, 2)
+    );
+
+    return result;
+
+  } catch (err) {
+    const props =
+      PropertiesService.getScriptProperties();
+
+    props.setProperty(
+      BTM_CONFIG.PROP_STATUS,
+      BTM_CONFIG.STATUS_FAILED
+    );
+
+    props.setProperty(
+      BTM_CONFIG.PROP_MESSAGE,
+      err.message
+    );
+
+    btmDeleteTriggers_();
+
+    throw err;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function btmStopJuneModelComparison() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  props.setProperty(
+    BTM_CONFIG.PROP_STATUS,
+    BTM_CONFIG.STATUS_STOPPED
+  );
+
+  props.setProperty(
+    BTM_CONFIG.PROP_MESSAGE,
+    'ユーザー操作で停止'
+  );
+
+  btmDeleteTriggers_();
+
+  return btmCheckJuneModelComparisonStatus();
+}
+
+function btmResumeJuneModelComparison() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const index =
+    props.getProperty(
+      BTM_CONFIG.PROP_INDEX
+    );
+
+  const total =
+    props.getProperty(
+      BTM_CONFIG.PROP_TOTAL
+    );
+
+  if (
+    index === null ||
+    total === null
+  ) {
+    throw new Error(
+      '再開可能な進捗情報がありません。'
+    );
+  }
+
+  props.setProperty(
+    BTM_CONFIG.PROP_STATUS,
+    BTM_CONFIG.STATUS_RUNNING
+  );
+
+  props.setProperty(
+    BTM_CONFIG.PROP_MESSAGE,
+    '比較を再開'
+  );
+
+  return btmRunJuneModelComparisonBatch();
+}
+
+function btmCheckJuneModelComparisonStatus() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const index = Number(
+    props.getProperty(
+      BTM_CONFIG.PROP_INDEX
+    ) || 0
+  );
+
+  const total = Number(
+    props.getProperty(
+      BTM_CONFIG.PROP_TOTAL
+    ) || 0
+  );
+
+  const result = {
+    status:
+      props.getProperty(
+        BTM_CONFIG.PROP_STATUS
+      ) ||
+      BTM_CONFIG.STATUS_IDLE,
+
+    processed:
+      index,
+
+    total:
+      total,
+
+    progress:
+      total > 0
+        ? index / total
+        : 0,
+
+    message:
+      props.getProperty(
+        BTM_CONFIG.PROP_MESSAGE
+      ) || '',
+
+    startedAt:
+      props.getProperty(
+        BTM_CONFIG.PROP_STARTED_AT
+      ) || ''
+  };
+
+  console.log(
+    JSON.stringify(result, null, 2)
+  );
+
+  return result;
+}
+
+/**
+ * 6月の有効レースを読み込む。
+ * 1レース6艇、本番コース・着順・1着艇が揃うものだけ。
+ */
+function btmLoadValidationDataset_() {
+  const ss =
+    SpreadsheetApp.openById(
+      BTM_CONFIG.SPREADSHEET_ID
+    );
+
+  const raceSheet =
+    btmRequireSheet_(
+      ss,
+      BTM_CONFIG.RACE_SHEET
+    );
+
+  const racerSheet =
+    btmRequireSheet_(
+      ss,
+      BTM_CONFIG.RACER_SHEET
+    );
+
+  const raceValues =
+    raceSheet
+      .getDataRange()
+      .getValues();
+
+  const racerValues =
+    racerSheet
+      .getDataRange()
+      .getValues();
+
+  const rh =
+    btmHeaderMap_(
+      raceValues[0],
+      [
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        '1着艇',
+        'Result有'
+      ],
+      BTM_CONFIG.RACE_SHEET
+    );
+
+  const bh =
+    btmHeaderMap_(
+      racerValues[0],
+      [
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        '艇番',
+        '級別番号',
+        'F数',
+        '平均ST',
+        '全国勝率',
+        '全国2連率',
+        '全国3連率',
+        '当地勝率',
+        '当地2連率',
+        '当地3連率',
+        'モーター2連率',
+        'モーター3連率',
+        'ボート2連率',
+        'ボート3連率',
+        '結果有',
+        '本番コース',
+        '着順'
+      ],
+      BTM_CONFIG.RACER_SHEET
+    );
+
+  const raceMap = {};
+
+  raceValues
+    .slice(1)
+    .forEach(function(row) {
+      const raceId =
+        String(
+          row[rh.Race_ID] || ''
+        ).trim();
+
+      if (!raceId) {
+        return;
+      }
+
+      const date =
+        btmDateText_(
+          row[rh['日付']]
+        );
+
+      if (
+        date <
+          BTM_CONFIG.VALIDATION_START ||
+        date >
+          BTM_CONFIG.VALIDATION_END
+      ) {
+        return;
+      }
+
+      const firstLane =
+        btmIntOrNull_(
+          row[rh['1着艇']]
+        );
+
+      if (
+        !btmBoolean_(
+          row[rh['Result有']]
+        ) ||
+        firstLane === null ||
+        firstLane < 1 ||
+        firstLane > 6
+      ) {
+        return;
+      }
+
+      raceMap[raceId] = {
+        raceId:
+          raceId,
+
+        date:
+          date,
+
+        venueCode:
+          btmPad2_(
+            row[rh['場コード']]
+          ),
+
+        venue:
+          String(
+            row[rh['場']] || ''
+          ).trim(),
+
+        firstLane:
+          firstLane,
+
+        boats:
+          []
+      };
+    });
+
+  racerValues
+    .slice(1)
+    .forEach(function(row) {
+      const raceId =
+        String(
+          row[bh.Race_ID] || ''
+        ).trim();
+
+      const race =
+        raceMap[raceId];
+
+      if (!race) {
+        return;
+      }
+
+      const date =
+        btmDateText_(
+          row[bh['日付']]
+        );
+
+      if (
+        date <
+          BTM_CONFIG.VALIDATION_START ||
+        date >
+          BTM_CONFIG.VALIDATION_END
+      ) {
+        return;
+      }
+
+      if (
+        !btmBoolean_(
+          row[bh['結果有']]
+        )
+      ) {
+        return;
+      }
+
+      const lane =
+        btmIntOrNull_(
+          row[bh['艇番']]
+        );
+
+      const resultCourse =
+        btmIntOrNull_(
+          row[bh['本番コース']]
+        );
+
+      const finish =
+        btmIntOrNull_(
+          row[bh['着順']]
+        );
+
+      if (
+        lane === null ||
+        resultCourse === null ||
+        finish === null
+      ) {
+        return;
+      }
+
+      race.boats.push({
+        lane:
+          lane,
+
+        resultCourse:
+          resultCourse,
+
+        finish:
+          finish,
+
+        className:
+          btmClassName_(
+            row[bh['級別番号']]
+          ),
+
+        flyingCount:
+          btmNumberOrNull_(
+            row[bh['F数']]
+          ),
+
+        avgSt:
+          btmNumberOrNull_(
+            row[bh['平均ST']]
+          ),
+
+        nationalWinRate:
+          btmNumberOrNull_(
+            row[bh['全国勝率']]
+          ),
+
+        national2Rate:
+          btmRateOrNull_(
+            row[bh['全国2連率']]
+          ),
+
+        national3Rate:
+          btmRateOrNull_(
+            row[bh['全国3連率']]
+          ),
+
+        localWinRate:
+          btmNumberOrNull_(
+            row[bh['当地勝率']]
+          ),
+
+        local2Rate:
+          btmRateOrNull_(
+            row[bh['当地2連率']]
+          ),
+
+        local3Rate:
+          btmRateOrNull_(
+            row[bh['当地3連率']]
+          ),
+
+        motor2Rate:
+          btmRateOrNull_(
+            row[bh['モーター2連率']]
+          ),
+
+        motor3Rate:
+          btmRateOrNull_(
+            row[bh['モーター3連率']]
+          ),
+
+        boat2Rate:
+          btmRateOrNull_(
+            row[bh['ボート2連率']]
+          ),
+
+        boat3Rate:
+          btmRateOrNull_(
+            row[bh['ボート3連率']]
+          )
+      });
+    });
+
+  return Object.keys(raceMap)
+    .map(function(key) {
+      return raceMap[key];
+    })
+    .filter(function(race) {
+      if (
+        race.boats.length !== 6
+      ) {
+        return false;
+      }
+
+      race.boats.sort(
+        function(a, b) {
+          return a.lane - b.lane;
+        }
+      );
+
+      const lanes =
+        race.boats.map(
+          function(x) {
+            return x.lane;
+          }
+        );
+
+      return [
+        1, 2, 3, 4, 5, 6
+      ].every(
+        function(lane, i) {
+          return lanes[i] === lane;
+        }
+      );
+    })
+    .sort(function(a, b) {
+      return a.raceId.localeCompare(
+        b.raceId
+      );
+    });
+}
+
+/**
+ * 5月候補値をParameter_Testから読み込む。
+ * 6月の方向再現性列・推奨列は一切参照しない。
+ */
+function btmLoadCandidateAdjust_() {
+  const ss =
+    SpreadsheetApp.openById(
+      BTM_CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    btmRequireSheet_(
+      ss,
+      BTM_CONFIG.PARAMETER_SHEET
+    );
+
+  const values =
+    sheet
+      .getDataRange()
+      .getValues();
+
+  let headerRow = -1;
+  let header = null;
+
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    if (
+      String(
+        values[i][0] || ''
+      ).trim() === 'Run_ID' &&
+      String(
+        values[i][1] || ''
+      ).trim() === 'Report_Type' &&
+      values[i]
+        .map(String)
+        .indexOf(
+          'V2候補スコア'
+        ) !== -1
+    ) {
+      headerRow = i;
+
+      header =
+        btmHeaderMap_(
+          values[i],
+          [
+            'Run_ID',
+            'Report_Type',
+            '場コード',
+            'コース',
+            'V2候補スコア'
+          ],
+          BTM_CONFIG.PARAMETER_SHEET
+        );
+    }
+  }
+
+  if (
+    headerRow < 0 ||
+    !header
+  ) {
+    throw new Error(
+      'VENUE_ADJUST_CANDIDATEのヘッダーを検出できません。'
+    );
+  }
+
+  const adjust = {};
+
+  for (
+    let i = headerRow + 1;
+    i < values.length;
+    i++
+  ) {
+    const row = values[i];
+
+    if (
+      String(
+        row[header.Run_ID] || ''
+      ).trim() !==
+      BTM_CONFIG.CANDIDATE_RUN_ID
+    ) {
+      continue;
+    }
+
+    if (
+      String(
+        row[
+          header.Report_Type
+        ] || ''
+      ).trim() !==
+      'VENUE_ADJUST_CANDIDATE'
+    ) {
+      continue;
+    }
+
+    const code =
+      btmPad2_(
+        row[
+          header['場コード']
+        ]
+      );
+
+    const course =
+      btmIntOrNull_(
+        row[
+          header['コース']
+        ]
+      );
+
+    const score =
+      btmNumberOrNull_(
+        row[
+          header['V2候補スコア']
+        ]
+      );
+
+    if (
+      !code ||
+      course === null ||
+      course < 1 ||
+      course > 6 ||
+      score === null
+    ) {
+      continue;
+    }
+
+    if (!adjust[code]) {
+      adjust[code] =
+        [0, 0, 0, 0, 0, 0];
+    }
+
+    adjust[code][
+      course - 1
+    ] = score;
+  }
+
+  return adjust;
+}
+
+function btmValidateCandidate_(
+  candidate
+) {
+  const codes =
+    Object.keys(candidate);
+
+  if (codes.length !== 24) {
+    throw new Error(
+      '候補会場数が24ではありません。実際=' +
+      codes.length
+    );
+  }
+
+  codes.forEach(
+    function(code) {
+      if (
+        !Array.isArray(
+          candidate[code]
+        ) ||
+        candidate[code].length !== 6
+      ) {
+        throw new Error(
+          '候補値が6コース分ありません: ' +
+          code
+        );
+      }
+    }
+  );
+}
+
+/**
+ * 現行朝モデルの会場補正以外のベーススコア。
+ */
+function btmCalculateBaseScore_(
+  boat,
+  course
+) {
+  const classPoint =
+    BTM_CLASS_POINTS[
+      boat.className
+    ] || 3;
+
+  const nationalWin =
+    btmFinite_(
+      boat.nationalWinRate
+    )
+      ? boat.nationalWinRate
+      : 4.5;
+
+  const localWin =
+    btmFinite_(
+      boat.localWinRate
+    )
+      ? boat.localWinRate
+      : nationalWin;
+
+  const twoRate =
+    btmFinite_(
+      boat.national2Rate
+    )
+      ? boat.national2Rate
+      : 0.30;
+
+  const threeRate =
+    btmFinite_(
+      boat.national3Rate
+    )
+      ? boat.national3Rate
+      : 0.48;
+
+  const local2Rate =
+    btmFinite_(
+      boat.local2Rate
+    )
+      ? boat.local2Rate
+      : twoRate;
+
+  const local3Rate =
+    btmFinite_(
+      boat.local3Rate
+    )
+      ? boat.local3Rate
+      : threeRate;
+
+  const avgSt =
+    btmFinite_(
+      boat.avgSt
+    ) &&
+    boat.avgSt > 0
+      ? boat.avgSt
+      : 0.18;
+
+  const motor =
+    btmFinite_(
+      boat.motor2Rate
+    )
+      ? boat.motor2Rate
+      : 0.33;
+
+  const motor3 =
+    btmFinite_(
+      boat.motor3Rate
+    )
+      ? boat.motor3Rate
+      : 0.50;
+
+  const boatRate =
+    btmFinite_(
+      boat.boat2Rate
+    )
+      ? boat.boat2Rate
+      : 0.33;
+
+  const boat3 =
+    btmFinite_(
+      boat.boat3Rate
+    )
+      ? boat.boat3Rate
+      : 0.50;
+
+  const flyingCount =
+    btmFinite_(
+      boat.flyingCount
+    )
+      ? boat.flyingCount
+      : 0;
+
+  let score = 0;
+
+  score += 30;
+  score += classPoint * 2.2;
+  score += nationalWin * 4.0;
+  score += localWin * 1.8;
+  score += twoRate * 16.0;
+  score += threeRate * 6.0;
+  score += local2Rate * 5.0;
+  score += local3Rate * 2.0;
+
+  score += btmClamp_(
+    (0.20 - avgSt) * 110,
+    -5,
+    9
+  );
+
+  score +=
+    (motor - 0.33) *
+    20.0;
+
+  score +=
+    (motor3 - 0.50) *
+    5.0;
+
+  score +=
+    (boatRate - 0.33) *
+    7.0;
+
+  score +=
+    (boat3 - 0.50) *
+    2.0;
+
+  score -=
+    flyingCount *
+    2.5;
+
+  score += [
+    20,
+    6,
+    2,
+    0,
+    -5,
+    -10
+  ][course - 1];
+
+  return score;
+}
+
+/**
+ * 3モデルに共通乱数を使用したMonte Carlo。
+ */
+function btmRunSharedMonteCarlo_(
+  scoreSets,
+  transform,
+  trials,
+  noiseSd,
+  seedText
+) {
+  const counts =
+    scoreSets.map(
+      function() {
+        return [
+          0, 0, 0, 0, 0, 0
+        ];
+      }
+    );
+
+  const random =
+    btmSeededRandom_(
+      btmHashString_(
+        seedText
+      )
+    );
+
+  for (
+    let t = 0;
+    t < trials;
+    t++
+  ) {
+    const z = [];
+
+    for (
+      let i = 0;
+      i < 6;
+      i++
+    ) {
+      z.push(
+        btmRandnWithRandom_(
+          random
+        )
+      );
+    }
+
+    const corr =
+      btmMultiplyLower_(
+        transform,
+        z
+      );
+
+    scoreSets.forEach(
+      function(scores, m) {
+        let bestLane = 0;
+        let bestValue = -Infinity;
+
+        for (
+          let i = 0;
+          i < 6;
+          i++
+        ) {
+          const value =
+            scores[i] +
+            corr[i] *
+              noiseSd;
+
+          if (
+            value > bestValue
+          ) {
+            bestValue = value;
+            bestLane = i;
+          }
+        }
+
+        counts[m][bestLane]++;
+      }
+    );
+  }
+
+  return counts.map(
+    function(modelCounts) {
+      return modelCounts.map(
+        function(count) {
+          return count / trials;
+        }
+      );
+    }
+  );
+}
+
+function btmNewAggregate_() {
+  return {
+    n: 0,
+    top1Correct: 0,
+    brierSum: 0,
+    logLossSum: 0,
+    inBrierSum: 0,
+
+    bins: Array.from(
+      {
+        length: 10
+      },
+      function() {
+        return {
+          n: 0,
+          probSum: 0,
+          winSum: 0
+        };
+      }
+    )
+  };
+}
+
+function btmReadAggregate_(
+  propertyName
+) {
+  const text =
+    PropertiesService
+      .getScriptProperties()
+      .getProperty(
+        propertyName
+      );
+
+  return text
+    ? JSON.parse(text)
+    : btmNewAggregate_();
+}
+
+function btmReadVenueAggregate_(
+  propertyName
+) {
+  const text =
+    PropertiesService
+      .getScriptProperties()
+      .getProperty(
+        propertyName
+      );
+
+  return text
+    ? JSON.parse(text)
+    : {};
+}
+
+/**
+ * 多クラスBrier:
+ * 6艇それぞれの(p-y)^2を合計。
+ *
+ * Log Loss:
+ * 実際の1着艇へ割り当てた確率の-ln(p)。
+ *
+ * 1号艇Brier:
+ * 1号艇勝利を二値事象として計算。
+ */
+function btmUpdateAggregate_(
+  agg,
+  probabilities,
+  actualLane
+) {
+  const actualIndex =
+    actualLane - 1;
+
+  let predictedIndex = 0;
+
+  for (
+    let i = 1;
+    i < 6;
+    i++
+  ) {
+    if (
+      probabilities[i] >
+      probabilities[
+        predictedIndex
+      ]
+    ) {
+      predictedIndex = i;
+    }
+  }
+
+  if (
+    predictedIndex ===
+    actualIndex
+  ) {
+    agg.top1Correct++;
+  }
+
+  let brier = 0;
+
+  for (
+    let i = 0;
+    i < 6;
+    i++
+  ) {
+    const y =
+      i === actualIndex
+        ? 1
+        : 0;
+
+    const diff =
+      probabilities[i] - y;
+
+    brier +=
+      diff * diff;
+  }
+
+  const actualProbability =
+    Math.max(
+      BTM_CONFIG.MIN_PROBABILITY,
+      probabilities[
+        actualIndex
+      ]
+    );
+
+  const inProbability =
+    probabilities[0];
+
+  const inActual =
+    actualLane === 1
+      ? 1
+      : 0;
+
+  agg.n++;
+  agg.brierSum += brier;
+
+  agg.logLossSum +=
+    -Math.log(
+      actualProbability
+    );
+
+  agg.inBrierSum +=
+    Math.pow(
+      inProbability -
+      inActual,
+      2
+    );
+
+  const binIndex =
+    Math.min(
+      9,
+      Math.floor(
+        inProbability * 10
+      )
+    );
+
+  agg.bins[
+    binIndex
+  ].n++;
+
+  agg.bins[
+    binIndex
+  ].probSum +=
+    inProbability;
+
+  agg.bins[
+    binIndex
+  ].winSum +=
+    inActual;
+}
+
+function btmUpdateVenueAggregate_(
+  venueMap,
+  venueCode,
+  venueName,
+  probabilities,
+  actualLane
+) {
+  if (
+    !venueMap[venueCode]
+  ) {
+    venueMap[venueCode] = {
+      venueCode:
+        venueCode,
+
+      venue:
+        venueName,
+
+      aggregate:
+        btmNewAggregate_()
+    };
+  }
+
+  btmUpdateAggregate_(
+    venueMap[
+      venueCode
+    ].aggregate,
+    probabilities,
+    actualLane
+  );
+}
+
+function btmFinalizeComparison_(
+  aggA,
+  aggB,
+  aggC,
+  venueAggA,
+  venueAggB,
+  venueAggC
+) {
+  const rows = [
+    btmMetricRow_(
+      'A_NO_VENUE',
+      aggA
+    ),
+
+    btmMetricRow_(
+      'B_CURRENT_V1',
+      aggB
+    ),
+
+    btmMetricRow_(
+      'C_SHRUNK_V2',
+      aggC
+    )
+  ];
+
+  const runId =
+    Utilities.formatDate(
+      new Date(),
+      BTM_CONFIG.TIMEZONE,
+      'yyyyMMdd_HHmmss'
+    );
+
+  btmAppendComparisonReport_(
+    runId,
+    rows,
+    [
+      aggA,
+      aggB,
+      aggC
+    ]
+  );
+
+  const venueSummary =
+    btmAppendVenueComparisonReport_(
+      runId,
+      venueAggA,
+      venueAggB,
+      venueAggC
+    );
+
+  const bestBrier =
+    rows
+      .slice()
+      .sort(
+        function(a, b) {
+          return (
+            a.brier -
+            b.brier
+          );
+        }
+      )[0];
+
+  const bestLogLoss =
+    rows
+      .slice()
+      .sort(
+        function(a, b) {
+          return (
+            a.logLoss -
+            b.logLoss
+          );
+        }
+      )[0];
+
+  const bestTop1 =
+    rows
+      .slice()
+      .sort(
+        function(a, b) {
+          return (
+            b.top1 -
+            a.top1
+          );
+        }
+      )[0];
+
+  return {
+    status:
+      BTM_CONFIG.STATUS_COMPLETED,
+
+    runId:
+      runId,
+
+    races:
+      rows[0].n,
+
+    models:
+      rows,
+
+    bestBrier:
+      bestBrier.model,
+
+    bestLogLoss:
+      bestLogLoss.model,
+
+    bestTop1Accuracy:
+      bestTop1.model,
+
+    venueSummary:
+      venueSummary,
+
+    adoptionRule:
+      'BrierとLog Lossを最優先。Top1悪化なし、1号艇Brier悪化なし、会場別の大幅悪化なしを確認して採否決定。'
+  };
+}
+
+function btmMetricRow_(
+  modelName,
+  agg
+) {
+  return {
+    model:
+      modelName,
+
+    n:
+      agg.n,
+
+    top1:
+      agg.n > 0
+        ? agg.top1Correct /
+          agg.n
+        : 0,
+
+    brier:
+      agg.n > 0
+        ? agg.brierSum /
+          agg.n
+        : 0,
+
+    logLoss:
+      agg.n > 0
+        ? agg.logLossSum /
+          agg.n
+        : 0,
+
+    inBrier:
+      agg.n > 0
+        ? agg.inBrierSum /
+          agg.n
+        : 0
+  };
+}
+
+function btmAppendComparisonReport_(
+  runId,
+  metrics,
+  aggregates
+) {
+  const ss =
+    SpreadsheetApp.openById(
+      BTM_CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    btmRequireSheet_(
+      ss,
+      BTM_CONFIG.PARAMETER_SHEET
+    );
+
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    '期間区分',
+    '開始日',
+    '終了日',
+    'モデル名',
+    'Noise_SD',
+    'Venue_Weight',
+    'Correlation_Mode',
+    'MC_Trials',
+    '対象レース数',
+    'Top1_Accuracy',
+    'Brier_Score',
+    'Log_Loss',
+    '1号艇_Brier',
+    'Candidate_Run_ID',
+    '作成日時',
+    'Memo'
+  ];
+
+  const now =
+    new Date();
+
+  const rows =
+    metrics.map(
+      function(x) {
+        return [
+          runId,
+          'JUNE_MODEL_COMPARISON',
+          'VALIDATION_2026-06',
+          BTM_CONFIG.VALIDATION_START,
+          BTM_CONFIG.VALIDATION_END,
+          x.model,
+          BTM_CONFIG.NOISE_SD,
+          BTM_CONFIG.VENUE_WEIGHT,
+          BTM_CONFIG.CORRELATION_MODE,
+          BTM_CONFIG.MC_TRIALS,
+          x.n,
+          x.top1,
+          x.brier,
+          x.logLoss,
+          x.inBrier,
+          BTM_CONFIG.CANDIDATE_RUN_ID,
+          now,
+          (
+            x.model ===
+            'C_SHRUNK_V2'
+              ? '5月候補値を全144セル使用。6月による選別なし。'
+              : ''
+          )
+        ];
+      }
+    );
+
+  const startRow =
+    sheet.getLastRow() + 2;
+
+  const calibrationStartRow =
+    startRow +
+    rows.length +
+    3;
+
+  const requiredLastRow =
+    calibrationStartRow +
+    10 *
+      metrics.length +
+    1;
+
+  if (
+    requiredLastRow >
+    sheet.getMaxRows()
+  ) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredLastRow -
+        sheet.getMaxRows()
+    );
+  }
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      1,
+      headers.length
+    )
+    .setValues([
+      headers
+    ])
+    .setFontWeight(
+      'bold'
+    )
+    .setBackground(
+      '#FCE4D6'
+    );
+
+  sheet
+    .getRange(
+      startRow + 1,
+      1,
+      rows.length,
+      headers.length
+    )
+    .setValues(rows);
+
+  sheet
+    .getRange(
+      startRow + 1,
+      12,
+      rows.length,
+      1
+    )
+    .setNumberFormat(
+      '0.00%'
+    );
+
+  sheet
+    .getRange(
+      startRow + 1,
+      13,
+      rows.length,
+      3
+    )
+    .setNumberFormat(
+      '0.0000'
+    );
+
+  sheet
+    .getRange(
+      startRow + 1,
+      17,
+      rows.length,
+      1
+    )
+    .setNumberFormat(
+      'yyyy-mm-dd hh:mm:ss'
+    );
+
+  const calibrationHeaders = [
+    'Run_ID',
+    'Report_Type',
+    'モデル名',
+    '1号艇確率帯',
+    '件数',
+    '平均予測確率',
+    '実勝率',
+    '差'
+  ];
+
+  const calibrationRows = [];
+
+  aggregates.forEach(
+    function(
+      agg,
+      modelIndex
+    ) {
+      agg.bins.forEach(
+        function(bin, i) {
+          const avgProb =
+            bin.n > 0
+              ? bin.probSum /
+                bin.n
+              : 0;
+
+          const actualRate =
+            bin.n > 0
+              ? bin.winSum /
+                bin.n
+              : 0;
+
+          calibrationRows.push([
+            runId,
+            'IN_CALIBRATION',
+            metrics[
+              modelIndex
+            ].model,
+            (
+              i * 10 +
+              '-' +
+              (i + 1) * 10 +
+              '%'
+            ),
+            bin.n,
+            avgProb,
+            actualRate,
+            actualRate -
+              avgProb
+          ]);
+        }
+      );
+    }
+  );
+
+  sheet
+    .getRange(
+      calibrationStartRow,
+      1,
+      1,
+      calibrationHeaders.length
+    )
+    .setValues([
+      calibrationHeaders
+    ])
+    .setFontWeight(
+      'bold'
+    )
+    .setBackground(
+      '#FFF2CC'
+    );
+
+  sheet
+    .getRange(
+      calibrationStartRow + 1,
+      1,
+      calibrationRows.length,
+      calibrationHeaders.length
+    )
+    .setValues(
+      calibrationRows
+    );
+
+  sheet
+    .getRange(
+      calibrationStartRow + 1,
+      6,
+      calibrationRows.length,
+      3
+    )
+    .setNumberFormat(
+      '0.00%'
+    );
+
+  SpreadsheetApp.flush();
+}
+
+function btmAppendVenueComparisonReport_(
+  runId,
+  venueAggA,
+  venueAggB,
+  venueAggC
+) {
+  const ss =
+    SpreadsheetApp.openById(
+      BTM_CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    btmRequireSheet_(
+      ss,
+      BTM_CONFIG.PARAMETER_SHEET
+    );
+
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    '場コード',
+    '場',
+    'モデル名',
+    '対象レース数',
+    'Top1_Accuracy',
+    'Brier_Score',
+    'Log_Loss',
+    '1号艇_Brier',
+    'Brier順位',
+    'LogLoss順位',
+    'Top1順位',
+    '会場別推奨モデル',
+    '判定メモ'
+  ];
+
+  const modelMaps = [
+    {
+      model:
+        'A_NO_VENUE',
+
+      data:
+        venueAggA
+    },
+    {
+      model:
+        'B_CURRENT_V1',
+
+      data:
+        venueAggB
+    },
+    {
+      model:
+        'C_SHRUNK_V2',
+
+      data:
+        venueAggC
+    }
+  ];
+
+  const venueCodes =
+    Object.keys(
+      Object.assign(
+        {},
+        venueAggA,
+        venueAggB,
+        venueAggC
+      )
+    ).sort();
+
+  const rows = [];
+
+  const winCounts = {
+    A_NO_VENUE: 0,
+    B_CURRENT_V1: 0,
+    C_SHRUNK_V2: 0
+  };
+
+  const brierWinCounts = {
+    A_NO_VENUE: 0,
+    B_CURRENT_V1: 0,
+    C_SHRUNK_V2: 0
+  };
+
+  const logLossWinCounts = {
+    A_NO_VENUE: 0,
+    B_CURRENT_V1: 0,
+    C_SHRUNK_V2: 0
+  };
+
+  venueCodes.forEach(
+    function(code) {
+      const metrics =
+        modelMaps
+          .map(
+            function(item) {
+              const venueEntry =
+                item.data[code];
+
+              if (
+                !venueEntry
+              ) {
+                return null;
+              }
+
+              const metric =
+                btmMetricRow_(
+                  item.model,
+                  venueEntry.aggregate
+                );
+
+              metric.venue =
+                venueEntry.venue ||
+                '';
+
+              metric.venueCode =
+                code;
+
+              return metric;
+            }
+          )
+          .filter(Boolean);
+
+      if (
+        metrics.length === 0
+      ) {
+        return;
+      }
+
+      const brierOrder =
+        metrics
+          .slice()
+          .sort(
+            function(a, b) {
+              return (
+                a.brier -
+                b.brier
+              );
+            }
+          );
+
+      const logOrder =
+        metrics
+          .slice()
+          .sort(
+            function(a, b) {
+              return (
+                a.logLoss -
+                b.logLoss
+              );
+            }
+          );
+
+      const top1Order =
+        metrics
+          .slice()
+          .sort(
+            function(a, b) {
+              return (
+                b.top1 -
+                a.top1
+              );
+            }
+          );
+
+      brierWinCounts[
+        brierOrder[0].model
+      ]++;
+
+      logLossWinCounts[
+        logOrder[0].model
+      ]++;
+
+      const recommended =
+        btmChooseVenueModel_(
+          brierOrder,
+          logOrder,
+          top1Order
+        );
+
+      winCounts[
+        recommended.model
+      ]++;
+
+      metrics.forEach(
+        function(metric) {
+          rows.push([
+            runId,
+            'VENUE_MODEL_COMPARISON',
+            metric.venueCode,
+            metric.venue,
+            metric.model,
+            metric.n,
+            metric.top1,
+            metric.brier,
+            metric.logLoss,
+            metric.inBrier,
+
+            brierOrder.findIndex(
+              function(x) {
+                return (
+                  x.model ===
+                  metric.model
+                );
+              }
+            ) + 1,
+
+            logOrder.findIndex(
+              function(x) {
+                return (
+                  x.model ===
+                  metric.model
+                );
+              }
+            ) + 1,
+
+            top1Order.findIndex(
+              function(x) {
+                return (
+                  x.model ===
+                  metric.model
+                );
+              }
+            ) + 1,
+
+            recommended.model,
+
+            (
+              metric.model ===
+              recommended.model
+                ? recommended.memo
+                : ''
+            )
+          ]);
+        }
+      );
+    }
+  );
+
+  const startRow =
+    sheet.getLastRow() + 2;
+
+  const summaryStartRow =
+    startRow +
+    rows.length +
+    3;
+
+  const requiredLastRow =
+    summaryStartRow + 10;
+
+  if (
+    requiredLastRow >
+    sheet.getMaxRows()
+  ) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredLastRow -
+        sheet.getMaxRows()
+    );
+  }
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      1,
+      headers.length
+    )
+    .setValues([
+      headers
+    ])
+    .setFontWeight(
+      'bold'
+    )
+    .setBackground(
+      '#D9EAD3'
+    );
+
+  if (
+    rows.length > 0
+  ) {
+    sheet
+      .getRange(
+        startRow + 1,
+        1,
+        rows.length,
+        headers.length
+      )
+      .setValues(rows);
+
+    sheet
+      .getRange(
+        startRow + 1,
+        7,
+        rows.length,
+        1
+      )
+      .setNumberFormat(
+        '0.00%'
+      );
+
+    sheet
+      .getRange(
+        startRow + 1,
+        8,
+        rows.length,
+        3
+      )
+      .setNumberFormat(
+        '0.0000'
+      );
+  }
+
+  const summaryHeaders = [
+    'Run_ID',
+    'Report_Type',
+    'モデル名',
+    '会場別推奨数',
+    'Brier首位会場数',
+    'LogLoss首位会場数'
+  ];
+
+  const summaryRows =
+    BTM_MODEL_NAMES.map(
+      function(model) {
+        return [
+          runId,
+          'VENUE_MODEL_SUMMARY',
+          model,
+          winCounts[model],
+          brierWinCounts[model],
+          logLossWinCounts[model]
+        ];
+      }
+    );
+
+  sheet
+    .getRange(
+      summaryStartRow,
+      1,
+      1,
+      summaryHeaders.length
+    )
+    .setValues([
+      summaryHeaders
+    ])
+    .setFontWeight(
+      'bold'
+    )
+    .setBackground(
+      '#CFE2F3'
+    );
+
+  sheet
+    .getRange(
+      summaryStartRow + 1,
+      1,
+      summaryRows.length,
+      summaryHeaders.length
+    )
+    .setValues(
+      summaryRows
+    );
+
+  SpreadsheetApp.flush();
+
+  return {
+    venueCount:
+      venueCodes.length,
+
+    recommendedCounts:
+      winCounts,
+
+    brierWinnerCounts:
+      brierWinCounts,
+
+    logLossWinnerCounts:
+      logLossWinCounts
+  };
+}
+
+function btmChooseVenueModel_(
+  brierOrder,
+  logOrder,
+  top1Order
+) {
+  const brierBest =
+    brierOrder[0];
+
+  const logBest =
+    logOrder[0];
+
+  const top1Best =
+    top1Order[0];
+
+  if (
+    brierBest.model ===
+    logBest.model
+  ) {
+    return {
+      model:
+        brierBest.model,
+
+      memo:
+        'Brier・Log Lossとも首位'
+    };
+  }
+
+  const brierSecond =
+    brierOrder[1];
+
+  const brierGap =
+    brierSecond
+      ? (
+          brierSecond.brier -
+          brierBest.brier
+        )
+      : 0;
+
+  const logSecond =
+    logOrder[1];
+
+  const logGap =
+    logSecond
+      ? (
+          logSecond.logLoss -
+          logBest.logLoss
+        )
+      : 0;
+
+  if (
+    brierBest.model ===
+      'B_CURRENT_V1' &&
+    brierGap >= 0.002
+  ) {
+    return {
+      model:
+        'B_CURRENT_V1',
+
+      memo:
+        'Brier改善を優先'
+    };
+  }
+
+  if (
+    logBest.model ===
+      'B_CURRENT_V1' &&
+    logGap >= 0.01
+  ) {
+    return {
+      model:
+        'B_CURRENT_V1',
+
+      memo:
+        'Log Loss改善を優先'
+    };
+  }
+
+  if (
+    brierBest.model ===
+    top1Best.model
+  ) {
+    return {
+      model:
+        brierBest.model,
+
+      memo:
+        'Brier・Top1首位'
+    };
+  }
+
+  return {
+    model:
+      brierBest.model,
+
+    memo:
+      'Brier最優先で選択'
+  };
+}
+
+function btmScheduleNextTrigger_() {
+  btmDeleteTriggers_();
+
+  ScriptApp
+    .newTrigger(
+      BTM_CONFIG.TRIGGER_FUNCTION
+    )
+    .timeBased()
+    .after(
+      BTM_CONFIG
+        .NEXT_TRIGGER_MINUTES *
+      60 *
+      1000
+    )
+    .create();
+}
+
+function btmDeleteTriggers_() {
+  ScriptApp
+    .getProjectTriggers()
+    .forEach(
+      function(trigger) {
+        if (
+          trigger
+            .getHandlerFunction() ===
+          BTM_CONFIG
+            .TRIGGER_FUNCTION
+        ) {
+          ScriptApp.deleteTrigger(
+            trigger
+          );
+        }
+      }
+    );
+}
+
+function btmCholesky_(matrix) {
+  const size =
+    matrix.length;
+
+  const lower =
+    Array.from(
+      {
+        length: size
+      },
+      function() {
+        return Array(
+          size
+        ).fill(0);
+      }
+    );
+
+  for (
+    let i = 0;
+    i < size;
+    i++
+  ) {
+    for (
+      let j = 0;
+      j <= i;
+      j++
+    ) {
+      let sum = 0;
+
+      for (
+        let k = 0;
+        k < j;
+        k++
+      ) {
+        sum +=
+          lower[i][k] *
+          lower[j][k];
+      }
+
+      if (i === j) {
+        const value =
+          matrix[i][i] -
+          sum;
+
+        if (
+          value <= 0
+        ) {
+          throw new Error(
+            '相関行列が正定値ではありません。'
+          );
+        }
+
+        lower[i][j] =
+          Math.sqrt(
+            value
+          );
+
+      } else {
+        lower[i][j] =
+          (
+            matrix[i][j] -
+            sum
+          ) /
+          lower[j][j];
+      }
+    }
+  }
+
+  return lower;
+}
+
+function btmMultiplyLower_(
+  lower,
+  vector
+) {
+  return lower.map(
+    function(row, i) {
+      let sum = 0;
+
+      for (
+        let j = 0;
+        j <= i;
+        j++
+      ) {
+        sum +=
+          row[j] *
+          vector[j];
+      }
+
+      return sum;
+    }
+  );
+}
+
+/**
+ * 再実行しても同じレースで同じ乱数列になる。
+ */
+function btmSeededRandom_(seed) {
+  let state =
+    seed >>> 0;
+
+  return function() {
+    state +=
+      0x6D2B79F5;
+
+    let t = state;
+
+    t = Math.imul(
+      t ^ (
+        t >>> 15
+      ),
+      t | 1
+    );
+
+    t ^=
+      t +
+      Math.imul(
+        t ^ (
+          t >>> 7
+        ),
+        t | 61
+      );
+
+    return (
+      (
+        t ^ (
+          t >>> 14
+        )
+      ) >>> 0
+    ) / 4294967296;
+  };
+}
+
+function btmHashString_(text) {
+  let hash =
+    2166136261;
+
+  for (
+    let i = 0;
+    i < text.length;
+    i++
+  ) {
+    hash ^=
+      text.charCodeAt(i);
+
+    hash =
+      Math.imul(
+        hash,
+        16777619
+      );
+  }
+
+  return hash >>> 0;
+}
+
+function btmRandnWithRandom_(random) {
+  let u = 0;
+  let v = 0;
+
+  while (u === 0) {
+    u = random();
+  }
+
+  while (v === 0) {
+    v = random();
+  }
+
+  return (
+    Math.sqrt(
+      -2 *
+      Math.log(u)
+    ) *
+    Math.cos(
+      2 *
+      Math.PI *
+      v
+    )
+  );
+}
+
+function btmHeaderMap_(
+  headers,
+  required,
+  sheetName
+) {
+  const map = {};
+
+  headers.forEach(
+    function(value, index) {
+      map[
+        String(
+          value || ''
+        ).trim()
+      ] = index;
+    }
+  );
+
+  required.forEach(
+    function(name) {
+      if (
+        !Object.prototype
+          .hasOwnProperty
+          .call(
+            map,
+            name
+          )
+      ) {
+        throw new Error(
+          sheetName +
+          'に必須列がありません: ' +
+          name
+        );
+      }
+    }
+  );
+
+  return map;
+}
+
+function btmRequireSheet_(
+  ss,
+  name
+) {
+  const sheet =
+    ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error(
+      'シートがありません: ' +
+      name
+    );
+  }
+
+  return sheet;
+}
+
+function btmDateText_(value) {
+  if (
+    value instanceof Date &&
+    !isNaN(
+      value.getTime()
+    )
+  ) {
+    return Utilities.formatDate(
+      value,
+      BTM_CONFIG.TIMEZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  const match =
+    String(
+      value || ''
+    )
+      .trim()
+      .match(
+        /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/
+      );
+
+  if (!match) {
+    return '';
+  }
+
+  return [
+    match[1],
+    (
+      '0' +
+      match[2]
+    ).slice(-2),
+    (
+      '0' +
+      match[3]
+    ).slice(-2)
+  ].join('-');
+}
+
+function btmClassName_(value) {
+  const map = {
+    1: 'A1',
+    2: 'A2',
+    3: 'B1',
+    4: 'B2'
+  };
+
+  return map[
+    parseInt(
+      value,
+      10
+    )
+  ] || 'B2';
+}
+
+function btmBoolean_(value) {
+  if (
+    typeof value ===
+    'boolean'
+  ) {
+    return value;
+  }
+
+  const text =
+    String(
+      value || ''
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    text === 'true' ||
+    text === '1' ||
+    text === 'yes'
+  );
+}
+
+function btmNumberOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number =
+    Number(
+      String(value)
+        .replace(
+          /,/g,
+          ''
+        )
+        .replace(
+          '%',
+          ''
+        )
+        .trim()
+    );
+
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : null;
+}
+
+function btmRateOrNull_(value) {
+  const number =
+    btmNumberOrNull_(value);
+
+  if (
+    number === null
+  ) {
+    return null;
+  }
+
+  return number > 1.5
+    ? number / 100
+    : number;
+}
+
+function btmIntOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number =
+    parseInt(
+      value,
+      10
+    );
+
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : null;
+}
+
+function btmPad2_(value) {
+  const number =
+    parseInt(
+      value,
+      10
+    );
+
+  return Number.isFinite(
+    number
+  )
+    ? String(number)
+        .padStart(
+          2,
+          '0'
+        )
+    : '';
+}
+
+function btmFinite_(value) {
+  return (
+    typeof value ===
+      'number' &&
+    Number.isFinite(
+      value
+    )
+  );
+}
+
+function btmClamp_(
+  value,
+  min,
+  max
+) {
+  return Math.max(
+    min,
+    Math.min(
+      max,
+      value
+    )
+  );
+}
 

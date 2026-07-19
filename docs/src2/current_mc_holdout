@@ -1,1 +1,849 @@
+/**
+ * ボートレースMC バックテスト
+ * 採用中Morning MC ホールドアウト評価 GAS v0.1
+ *
+ * 評価対象:
+ *   2026-07-08〜2026-07-14
+ *
+ * 採用モデル:
+ *   MODEL_VERSION = morning_mc_v0.2.0_bt_202606
+ *   MC_TRIALS = 5000
+ *   NOISE_SD = 24
+ *   VENUE_WEIGHT = 0.25
+ *   CORRELATION_MODE = none
+ *
+ * 入力:
+ *   Backtest_Race
+ *   Backtest_Racer
+ *
+ * 出力:
+ *   Validation_Summary
+ *
+ * 実行順:
+ *   1. checkHMMCHoldoutReady
+ *   2. runHMMCHoldoutEvaluation
+ *
+ * 注意:
+ * - 既存シート・既存行は削除しない
+ * - 同一Test_IDが存在する場合は重複追記しない
+ * - 展示項目は使用しない
+ * - 本番モデルと同じ独立乱数を使用
+ */
+
+const HM_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  SUMMARY_SHEET: 'Validation_Summary',
+
+  EVAL_START: '2026-07-08',
+  EVAL_END: '2026-07-14',
+
+  MODEL_VERSION: 'morning_mc_v0.2.0_bt_202606',
+  MC_TRIALS: 5000,
+  NOISE_SD: 24,
+  VENUE_WEIGHT: 0.25,
+  CORRELATION_MODE: 'none',
+
+  EPSILON: 1e-6
+});
+
+const HM_SUMMARY_HEADERS = Object.freeze([
+  '順位',
+  'Test_ID',
+  'モデル名',
+  'Noise_SD',
+  'Venue_Weight',
+  'Correlation_Mode',
+  '対象レース数',
+  'Top1_Accuracy',
+  'Brier_Score',
+  'Log_Loss',
+  '1号艇_Brier',
+  '採用候補',
+  'Memo'
+]);
+
+const HM_CLASS_POINTS = Object.freeze({
+  1: 8, // A1
+  2: 6, // A2
+  3: 3, // B1
+  4: 1  // B2
+});
+
+const HM_VENUE_ADJUST = Object.freeze({
+  '01': [-12, 0,  4,  8,  5,  2],
+  '02': [-18, 0, 10, 18, 14,  6],
+  '03': [-20, 0,  8, 16, 12,  8],
+  '04': [  0, 0,  0,  0,  0,  0],
+  '05': [ 10, 0, -4, -6, -8,-10],
+  '06': [  2, 0,  0,  2,  0,  0],
+  '07': [ 14, 0, -5, -8,-10,-12],
+  '08': [ 10, 0, -4, -6, -8,-10],
+  '09': [  4, 0,  0,  0,  0,  0],
+  '10': [ -8, 0,  4,  8,  6,  2],
+  '11': [ -6, 0,  6, 12,  8,  2],
+  '12': [  2, 0,  0,  2,  0,  0],
+  '13': [ 12, 0, -4, -8,-10,-12],
+  '14': [ 14, 0, -4, -6,-10,-12],
+  '15': [  6, 0,  0,  0,  0,  0],
+  '16': [ 16, 0, -6,-10,-12,-14],
+  '17': [ 20, 0, -8,-12,-16,-18],
+  '18': [ 18, 0, -6,-10,-12,-14],
+  '19': [  4, 0,  0,  0,  0,  0],
+  '20': [  0, 0,  4,  6,  4,  2],
+  '21': [ 16, 0, -6,-10,-12,-14],
+  '22': [ -8, 0,  6, 10,  8,  4],
+  '23': [ 10, 0, -4, -6, -8,-10],
+  '24': [ 24, 0, -8,-12,-16,-20]
+});
+
+/**
+ * 本実行
+ */
+function runHMMCHoldoutEvaluation() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.openById(HM_CONFIG.SPREADSHEET_ID);
+
+    const raceSheet = hmRequireSheet_(ss, HM_CONFIG.RACE_SHEET);
+    const racerSheet = hmRequireSheet_(ss, HM_CONFIG.RACER_SHEET);
+    const summarySheet = hmRequireSheet_(ss, HM_CONFIG.SUMMARY_SHEET);
+
+    hmVerifySummaryHeaders_(summarySheet);
+
+    const races = hmReadEvaluationRaces_(raceSheet);
+    const racersByRace = hmReadRacersByRace_(racerSheet);
+
+    hmValidateRaceData_(races, racersByRace);
+
+    const metrics = hmEvaluateCurrentModel_(races, racersByRace);
+
+    const testId = [
+      'HOLDOUT',
+      '20260708_20260714',
+      'N24',
+      'V0p25',
+      'independent',
+      HM_CONFIG.MODEL_VERSION
+    ].join('_');
+
+    const existingIds = hmReadExistingTestIds_(summarySheet);
+
+    let appended = false;
+
+    if (!existingIds.has(testId)) {
+      const appendRow = hmFindAppendRow_(summarySheet);
+
+      const output = [[
+        '',
+        testId,
+        'Holdout / Noise=24 / Venue=0.25 / Corr=none',
+        HM_CONFIG.NOISE_SD,
+        HM_CONFIG.VENUE_WEIGHT,
+        HM_CONFIG.CORRELATION_MODE,
+        metrics.raceCount,
+        metrics.top1Accuracy,
+        metrics.brierScore,
+        metrics.logLoss,
+        metrics.boat1Brier,
+        true,
+        '評価期間=' +
+          HM_CONFIG.EVAL_START +
+          '〜' +
+          HM_CONFIG.EVAL_END +
+          '。採用中Morning MCを5000試行で準アウトオブサンプル評価。展示未使用。'
+      ]];
+
+      summarySheet
+        .getRange(
+          appendRow,
+          1,
+          1,
+          HM_SUMMARY_HEADERS.length
+        )
+        .setValues(output);
+
+      summarySheet
+        .getRange(appendRow, 4, 1, 2)
+        .setNumberFormat('0.000');
+
+      summarySheet
+        .getRange(appendRow, 7, 1, 1)
+        .setNumberFormat('0');
+
+      summarySheet
+        .getRange(appendRow, 8, 1, 4)
+        .setNumberFormat('0.0000');
+
+      SpreadsheetApp.flush();
+      appended = true;
+    } else {
+      console.log('既存Test_IDのため追記スキップ: ' + testId);
+    }
+
+    const result = {
+      status: 'COMPLETED',
+      testId: testId,
+      modelVersion: HM_CONFIG.MODEL_VERSION,
+      evalPeriod:
+        HM_CONFIG.EVAL_START +
+        '〜' +
+        HM_CONFIG.EVAL_END,
+      mcTrials: HM_CONFIG.MC_TRIALS,
+      noiseSd: HM_CONFIG.NOISE_SD,
+      venueWeight: HM_CONFIG.VENUE_WEIGHT,
+      correlationMode: HM_CONFIG.CORRELATION_MODE,
+      appended: appended,
+      metrics: metrics
+    };
+
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 書き込みなし事前確認
+ */
+function checkHMMCHoldoutReady() {
+  const ss = SpreadsheetApp.openById(HM_CONFIG.SPREADSHEET_ID);
+
+  const raceSheet = hmRequireSheet_(ss, HM_CONFIG.RACE_SHEET);
+  const racerSheet = hmRequireSheet_(ss, HM_CONFIG.RACER_SHEET);
+  const summarySheet = hmRequireSheet_(ss, HM_CONFIG.SUMMARY_SHEET);
+
+  hmVerifySummaryHeaders_(summarySheet);
+
+  const races = hmReadEvaluationRaces_(raceSheet);
+  const racersByRace = hmReadRacersByRace_(racerSheet);
+
+  hmValidateRaceData_(races, racersByRace);
+
+  const result = {
+    status: 'READY',
+    spreadsheet: ss.getName(),
+    evalPeriod:
+      HM_CONFIG.EVAL_START +
+      '〜' +
+      HM_CONFIG.EVAL_END,
+    raceCount: races.length,
+    racerRaceCount: Object.keys(racersByRace).length,
+    modelVersion: HM_CONFIG.MODEL_VERSION,
+    mcTrials: HM_CONFIG.MC_TRIALS,
+    noiseSd: HM_CONFIG.NOISE_SD,
+    venueWeight: HM_CONFIG.VENUE_WEIGHT,
+    correlationMode: HM_CONFIG.CORRELATION_MODE,
+    exhibitionUsed: false
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function hmEvaluateCurrentModel_(races, racersByRace) {
+  let top1Correct = 0;
+  let brierSum = 0;
+  let logLossSum = 0;
+  let boat1BrierSum = 0;
+
+  races.forEach(function(race, index) {
+    const racers = racersByRace[race.raceId];
+
+    const baseScores = racers.map(function(racer) {
+      return hmCalculateBaseScore_(
+        racer,
+        racer.boatNo,
+        race.venueCode
+      );
+    });
+
+    const probabilities = hmRunIndependentMonteCarlo_(
+      baseScores,
+      HM_CONFIG.MC_TRIALS,
+      HM_CONFIG.NOISE_SD
+    );
+
+    const predictedTopBoat =
+      probabilities.indexOf(
+        Math.max.apply(null, probabilities)
+      ) + 1;
+
+    if (predictedTopBoat === race.winnerBoat) {
+      top1Correct++;
+    }
+
+    let raceBrier = 0;
+
+    for (let boat = 1; boat <= 6; boat++) {
+      const actual = boat === race.winnerBoat ? 1 : 0;
+      const predicted = probabilities[boat - 1];
+      const diff = predicted - actual;
+      raceBrier += diff * diff;
+    }
+
+    brierSum += raceBrier / 6;
+
+    const winnerProbability = hmClamp_(
+      probabilities[race.winnerBoat - 1],
+      HM_CONFIG.EPSILON,
+      1 - HM_CONFIG.EPSILON
+    );
+
+    logLossSum += -Math.log(winnerProbability);
+
+    const boat1Actual = race.winnerBoat === 1 ? 1 : 0;
+    const boat1Diff = probabilities[0] - boat1Actual;
+    boat1BrierSum += boat1Diff * boat1Diff;
+
+    if ((index + 1) % 100 === 0) {
+      console.log(
+        '進捗: ' +
+        (index + 1) +
+        '/' +
+        races.length
+      );
+    }
+  });
+
+  return {
+    raceCount: races.length,
+    top1Accuracy: top1Correct / races.length,
+    brierScore: brierSum / races.length,
+    logLoss: logLossSum / races.length,
+    boat1Brier: boat1BrierSum / races.length
+  };
+}
+
+function hmCalculateBaseScore_(racer, course, venueCode) {
+  const classPoint =
+    HM_CLASS_POINTS[racer.classNumber] || 3;
+
+  const nationalWin =
+    hmIsFiniteNumber_(racer.nationalWinRate)
+      ? racer.nationalWinRate
+      : 4.5;
+
+  const localWin =
+    hmIsFiniteNumber_(racer.localWinRate)
+      ? racer.localWinRate
+      : nationalWin;
+
+  const national2Rate =
+    hmIsFiniteNumber_(racer.national2Rate)
+      ? racer.national2Rate
+      : 0.30;
+
+  const national3Rate =
+    hmIsFiniteNumber_(racer.national3Rate)
+      ? racer.national3Rate
+      : 0.48;
+
+  const local2Rate =
+    hmIsFiniteNumber_(racer.local2Rate)
+      ? racer.local2Rate
+      : national2Rate;
+
+  const local3Rate =
+    hmIsFiniteNumber_(racer.local3Rate)
+      ? racer.local3Rate
+      : national3Rate;
+
+  const avgSt =
+    hmIsFiniteNumber_(racer.avgSt) && racer.avgSt > 0
+      ? racer.avgSt
+      : 0.18;
+
+  const motor2Rate =
+    hmIsFiniteNumber_(racer.motor2Rate)
+      ? racer.motor2Rate
+      : 0.33;
+
+  const motor3Rate =
+    hmIsFiniteNumber_(racer.motor3Rate)
+      ? racer.motor3Rate
+      : 0.50;
+
+  const boat2Rate =
+    hmIsFiniteNumber_(racer.boat2Rate)
+      ? racer.boat2Rate
+      : 0.33;
+
+  const boat3Rate =
+    hmIsFiniteNumber_(racer.boat3Rate)
+      ? racer.boat3Rate
+      : 0.50;
+
+  const flyingCount =
+    hmIsFiniteNumber_(racer.flyingCount)
+      ? racer.flyingCount
+      : 0;
+
+  let score = 0;
+
+  score += 30;
+  score += classPoint * 2.2;
+  score += nationalWin * 4.0;
+  score += localWin * 1.8;
+  score += national2Rate * 16.0;
+  score += national3Rate * 6.0;
+  score += local2Rate * 5.0;
+  score += local3Rate * 2.0;
+  score += hmClamp_((0.20 - avgSt) * 110, -5, 9);
+  score += (motor2Rate - 0.33) * 20.0;
+  score += (motor3Rate - 0.50) * 5.0;
+  score += (boat2Rate - 0.33) * 7.0;
+  score += (boat3Rate - 0.50) * 2.0;
+  score -= flyingCount * 2.5;
+
+  const courseBase = [20, 6, 2, 0, -5, -10][
+    course - 1
+  ];
+
+  score += courseBase;
+
+  const venue = HM_VENUE_ADJUST[venueCode];
+
+  if (venue) {
+    score += venue[course - 1] * HM_CONFIG.VENUE_WEIGHT;
+  }
+
+  return score;
+}
+
+function hmRunIndependentMonteCarlo_(baseScores, trials, noiseSd) {
+  const wins = [0, 0, 0, 0, 0, 0];
+
+  for (let trial = 0; trial < trials; trial++) {
+    let bestBoat = 0;
+    let bestScore = -Infinity;
+
+    for (let boat = 0; boat < 6; boat++) {
+      const simulated =
+        baseScores[boat] +
+        hmRandn_() * noiseSd;
+
+      if (simulated > bestScore) {
+        bestScore = simulated;
+        bestBoat = boat;
+      }
+    }
+
+    wins[bestBoat]++;
+  }
+
+  return wins.map(function(count) {
+    return count / trials;
+  });
+}
+
+function hmReadEvaluationRaces_(sheet) {
+  const table = hmReadTable_(sheet);
+  const headers = table.headers;
+  const index = hmHeaderIndex_(headers);
+
+  hmRequireHeaders_(
+    headers,
+    [
+      'Race_ID',
+      '日付',
+      '場コード',
+      '場',
+      'R',
+      'Result有',
+      '1着艇'
+    ],
+    HM_CONFIG.RACE_SHEET
+  );
+
+  return table.rows
+    .map(function(row) {
+      return {
+        raceId: String(row[index['Race_ID']] || '').trim(),
+        date: hmNormalizeDateText_(row[index['日付']]),
+        venueCode: String(
+          row[index['場コード']] || ''
+        ).padStart(2, '0'),
+        venueName: String(row[index['場']] || '').trim(),
+        raceNo: hmToInt_(row[index['R']]),
+        resultAvailable: hmToBoolean_(row[index['Result有']]),
+        winnerBoat: hmToInt_(row[index['1着艇']])
+      };
+    })
+    .filter(function(row) {
+      return (
+        row.raceId &&
+        row.resultAvailable &&
+        row.winnerBoat >= 1 &&
+        row.winnerBoat <= 6 &&
+        row.date >= HM_CONFIG.EVAL_START &&
+        row.date <= HM_CONFIG.EVAL_END
+      );
+    });
+}
+
+function hmReadRacersByRace_(sheet) {
+  const table = hmReadTable_(sheet);
+  const headers = table.headers;
+  const index = hmHeaderIndex_(headers);
+
+  hmRequireHeaders_(
+    headers,
+    [
+      'Racer_Row_ID',
+      'Race_ID',
+      '艇番',
+      '級別番号',
+      'F数',
+      'L数',
+      '平均ST',
+      '全国勝率',
+      '全国2連率',
+      '全国3連率',
+      '当地勝率',
+      '当地2連率',
+      '当地3連率',
+      'モーター2連率',
+      'モーター3連率',
+      'ボート2連率',
+      'ボート3連率'
+    ],
+    HM_CONFIG.RACER_SHEET
+  );
+
+  const byRace = {};
+
+  table.rows.forEach(function(row) {
+    const raceId = String(row[index['Race_ID']] || '').trim();
+
+    if (!raceId) {
+      return;
+    }
+
+    const dateText = raceId.slice(0, 8);
+
+    if (
+      dateText < HM_CONFIG.EVAL_START.replace(/-/g, '') ||
+      dateText > HM_CONFIG.EVAL_END.replace(/-/g, '')
+    ) {
+      return;
+    }
+
+    const racer = {
+      raceId: raceId,
+      boatNo: hmToInt_(row[index['艇番']]),
+      classNumber: hmToInt_(row[index['級別番号']]),
+      flyingCount: hmToInt_(row[index['F数']]),
+      lateCount: hmToInt_(row[index['L数']]),
+      avgSt: hmToNumber_(row[index['平均ST']]),
+
+      nationalWinRate: hmToNumber_(row[index['全国勝率']]),
+      national2Rate: hmNormalizeRate_(row[index['全国2連率']]),
+      national3Rate: hmNormalizeRate_(row[index['全国3連率']]),
+
+      localWinRate: hmToNumber_(row[index['当地勝率']]),
+      local2Rate: hmNormalizeRate_(row[index['当地2連率']]),
+      local3Rate: hmNormalizeRate_(row[index['当地3連率']]),
+
+      motor2Rate: hmNormalizeRate_(row[index['モーター2連率']]),
+      motor3Rate: hmNormalizeRate_(row[index['モーター3連率']]),
+
+      boat2Rate: hmNormalizeRate_(row[index['ボート2連率']]),
+      boat3Rate: hmNormalizeRate_(row[index['ボート3連率']])
+    };
+
+    if (!byRace[raceId]) {
+      byRace[raceId] = [];
+    }
+
+    byRace[raceId].push(racer);
+  });
+
+  Object.keys(byRace).forEach(function(raceId) {
+    byRace[raceId].sort(function(a, b) {
+      return a.boatNo - b.boatNo;
+    });
+  });
+
+  return byRace;
+}
+
+function hmValidateRaceData_(races, racersByRace) {
+  if (!races.length) {
+    throw new Error('評価対象レースが0件です。');
+  }
+
+  const invalid = [];
+
+  races.forEach(function(race) {
+    const racers = racersByRace[race.raceId];
+
+    if (!racers || racers.length !== 6) {
+      invalid.push(
+        race.raceId +
+        '(' +
+        (racers ? racers.length : 0) +
+        '艇)'
+      );
+      return;
+    }
+
+    const boatNumbers = racers.map(function(racer) {
+      return racer.boatNo;
+    }).join(',');
+
+    if (boatNumbers !== '1,2,3,4,5,6') {
+      invalid.push(
+        race.raceId +
+        '(艇番=' +
+        boatNumbers +
+        ')'
+      );
+    }
+  });
+
+  if (invalid.length) {
+    throw new Error(
+      '6艇整合しないレースがあります。例: ' +
+      invalid.slice(0, 10).join(', ')
+    );
+  }
+}
+
+function hmReadTable_(sheet) {
+  const values = sheet.getDataRange().getValues();
+
+  if (!values.length) {
+    throw new Error(sheet.getName() + 'が空です。');
+  }
+
+  return {
+    headers: values[0].map(function(value) {
+      return String(value || '').trim();
+    }),
+    rows: values.slice(1)
+  };
+}
+
+function hmVerifySummaryHeaders_(sheet) {
+  const actual = sheet
+    .getRange(1, 1, 1, HM_SUMMARY_HEADERS.length)
+    .getDisplayValues()[0];
+
+  const mismatches = [];
+
+  HM_SUMMARY_HEADERS.forEach(function(expected, index) {
+    if (actual[index] !== expected) {
+      mismatches.push(
+        (index + 1) +
+        '列目: "' +
+        actual[index] +
+        '" → "' +
+        expected +
+        '"'
+      );
+    }
+  });
+
+  if (mismatches.length) {
+    throw new Error(
+      'Validation_Summaryのヘッダー不一致: ' +
+      mismatches.join(', ')
+    );
+  }
+}
+
+function hmReadExistingTestIds_(sheet) {
+  const set = new Set();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    return set;
+  }
+
+  sheet
+    .getRange(2, 2, lastRow - 1, 1)
+    .getDisplayValues()
+    .forEach(function(row) {
+      const value = String(row[0] || '').trim();
+
+      if (value) {
+        set.add(value);
+      }
+    });
+
+  return set;
+}
+
+function hmFindAppendRow_(sheet) {
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    return 2;
+  }
+
+  const values = sheet
+    .getRange(2, 2, lastRow - 1, 1)
+    .getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim()) {
+      return i + 3;
+    }
+  }
+
+  return 2;
+}
+
+function hmRequireSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error('シートがありません: ' + name);
+  }
+
+  return sheet;
+}
+
+function hmHeaderIndex_(headers) {
+  const index = {};
+
+  headers.forEach(function(header, i) {
+    index[header] = i;
+  });
+
+  return index;
+}
+
+function hmRequireHeaders_(headers, required, sheetName) {
+  const missing = required.filter(function(header) {
+    return headers.indexOf(header) === -1;
+  });
+
+  if (missing.length) {
+    throw new Error(
+      sheetName +
+      'に必須列がありません: ' +
+      missing.join(', ')
+    );
+  }
+}
+
+function hmNormalizeDateText_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(
+      value,
+      'Asia/Tokyo',
+      'yyyy-MM-dd'
+    );
+  }
+
+  const text = String(value || '').trim();
+
+  const match = text.match(
+    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/
+  );
+
+  if (!match) {
+    return '';
+  }
+
+  return [
+    match[1],
+    ('0' + match[2]).slice(-2),
+    ('0' + match[3]).slice(-2)
+  ].join('-');
+}
+
+function hmNormalizeRate_(value) {
+  const number = hmToNumber_(value);
+
+  if (!hmIsFiniteNumber_(number)) {
+    return NaN;
+  }
+
+  return number > 1.5
+    ? number / 100
+    : number;
+}
+
+function hmToNumber_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return NaN;
+  }
+
+  const number = Number(
+    String(value)
+      .replace('%', '')
+      .replace(',', '.')
+      .trim()
+  );
+
+  return Number.isFinite(number)
+    ? number
+    : NaN;
+}
+
+function hmToInt_(value) {
+  const number = parseInt(value, 10);
+
+  return Number.isFinite(number)
+    ? number
+    : 0;
+}
+
+function hmToBoolean_(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const text = String(value || '')
+    .trim()
+    .toLowerCase();
+
+  return (
+    text === 'true' ||
+    text === '1' ||
+    text === 'yes' ||
+    text === 'y'
+  );
+}
+
+function hmIsFiniteNumber_(value) {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value)
+  );
+}
+
+function hmClamp_(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function hmRandn_() {
+  let u = 0;
+  let v = 0;
+
+  while (u === 0) {
+    u = Math.random();
+  }
+
+  while (v === 0) {
+    v = Math.random();
+  }
+
+  return (
+    Math.sqrt(-2.0 * Math.log(u)) *
+    Math.cos(2.0 * Math.PI * v)
+  );
+}
 

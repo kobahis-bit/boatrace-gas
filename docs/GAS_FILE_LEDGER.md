@@ -8,7 +8,7 @@
 | コード.gs | バックテスト用７月初旬 | - | 今後不要 | - |
 | backtest engine.gs | エンジン検証用① | - | 今後不要 | - |
 | baseline_comparison.gs | ６月データから７月初旬のテスト | - | 今後不要 | - |
-| probability.gs | 確率計算・正規化 | - | 未登録 | - |
+| current_mc_holdout.gs | ７月初旬モンテカルロテスト | - | 今後不要 | - |
 | market_analysis.gs | オッズ・EV計算 | - | 未登録 | - |
 | screening.gs | BUY/WATCH/PASS判定 | - | 未登録 | - |
 | race_summary.gs | Race_Logへの出力 | - | 未登録 | - |

@@ -1,1 +1,1219 @@
+/**
+ * BoatRace Holdout B vs D Comparison v1.0.0
+ * ------------------------------------------------------------
+ * 完全未見期間:
+ *   2026-07-08 ～ 2026-07-14
+ *
+ * 比較モデル:
+ *
+ * B_CURRENT_V1
+ *   全24場で現行会場補正を使用
+ *
+ * D_HYBRID_V1
+ *   以下5場のみ会場補正なし
+ *   01 桐生
+ *   02 戸田
+ *   03 江戸川
+ *   10 三国
+ *   11 びわこ
+ *
+ * それ以外は現行会場補正を使用
+ *
+ * 評価:
+ * - Brier Score
+ * - Log Loss
+ * - Top1 Accuracy
+ * - 1号艇Brier
+ * - 1号艇Calibration
+ *
+ * 実行順:
+ * 1. btdStartHoldoutComparison()
+ * 2. btdCheckHoldoutComparisonStatus()
+ */
+
+const BTD_CONFIG = Object.freeze({
+  SPREADSHEET_ID:
+    '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  PARAMETER_SHEET: 'Parameter_Test',
+
+  TIMEZONE: 'Asia/Tokyo',
+
+  HOLDOUT_START: '2026-07-08',
+  HOLDOUT_END: '2026-07-14',
+
+  MC_TRIALS: 5000,
+  NOISE_SD: 18,
+  VENUE_WEIGHT: 0.35,
+  CORRELATION_MODE: 'fixed_cholesky_v1',
+
+  RACES_PER_BATCH: 80,
+  NEXT_TRIGGER_MINUTES: 1,
+
+  TRIGGER_FUNCTION:
+    'btdRunHoldoutComparisonBatch',
+
+  PROP_STATUS: 'BTD_STATUS',
+  PROP_INDEX: 'BTD_INDEX',
+  PROP_TOTAL: 'BTD_TOTAL',
+  PROP_MESSAGE: 'BTD_MESSAGE',
+  PROP_STARTED_AT: 'BTD_STARTED_AT',
+
+  PROP_B: 'BTD_AGG_B',
+  PROP_D: 'BTD_AGG_D',
+
+  STATUS_IDLE: 'IDLE',
+  STATUS_RUNNING: 'RUNNING',
+  STATUS_COMPLETED: 'COMPLETED',
+  STATUS_STOPPED: 'STOPPED',
+  STATUS_FAILED: 'FAILED'
+});
+
+const BTD_MODEL_NAMES = Object.freeze([
+  'B_CURRENT_V1',
+  'D_HYBRID_V1'
+]);
+
+/**
+ * 6月検証で現行補正が明確に悪化した会場。
+ *
+ * Dモデルでは、この5場だけ補正なしにする。
+ */
+const BTD_NO_VENUE_CODES = Object.freeze([
+  '01', // 桐生
+  '02', // 戸田
+  '03', // 江戸川
+  '10', // 三国
+  '11'  // びわこ
+]);
+
+/**
+ * 比較開始。
+ */
+function btdStartHoldoutComparison() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    btdDeleteTriggers_();
+
+    const dataset =
+      btdLoadHoldoutDataset_();
+
+    if (dataset.length === 0) {
+      throw new Error(
+        '完全未見期間の有効レースがありません。'
+      );
+    }
+
+    const props =
+      PropertiesService.getScriptProperties();
+
+    props.setProperties({
+      [BTD_CONFIG.PROP_STATUS]:
+        BTD_CONFIG.STATUS_RUNNING,
+
+      [BTD_CONFIG.PROP_INDEX]:
+        '0',
+
+      [BTD_CONFIG.PROP_TOTAL]:
+        String(dataset.length),
+
+      [BTD_CONFIG.PROP_MESSAGE]:
+        '7月完全未見データ比較を開始',
+
+      [BTD_CONFIG.PROP_STARTED_AT]:
+        new Date().toISOString(),
+
+      [BTD_CONFIG.PROP_B]:
+        JSON.stringify(
+          btmNewAggregate_()
+        ),
+
+      [BTD_CONFIG.PROP_D]:
+        JSON.stringify(
+          btmNewAggregate_()
+        )
+    }, true);
+
+    const result = {
+      status: BTD_CONFIG.STATUS_RUNNING,
+      period:
+        BTD_CONFIG.HOLDOUT_START +
+        '～' +
+        BTD_CONFIG.HOLDOUT_END,
+      totalValidRaces: dataset.length,
+      mcTrials: BTD_CONFIG.MC_TRIALS,
+      racesPerBatch:
+        BTD_CONFIG.RACES_PER_BATCH,
+      models: BTD_MODEL_NAMES,
+      hybridNoVenueCodes:
+        BTD_NO_VENUE_CODES
+    };
+
+    console.log(
+      JSON.stringify(result, null, 2)
+    );
+
+    return btdRunHoldoutComparisonBatch();
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * バッチ処理。
+ */
+function btdRunHoldoutComparisonBatch() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const props =
+      PropertiesService.getScriptProperties();
+
+    const status =
+      props.getProperty(
+        BTD_CONFIG.PROP_STATUS
+      );
+
+    if (
+      status !==
+      BTD_CONFIG.STATUS_RUNNING
+    ) {
+      btdDeleteTriggers_();
+
+      return btdCheckHoldoutComparisonStatus();
+    }
+
+    const dataset =
+      btdLoadHoldoutDataset_();
+
+    const transform =
+      btmCholesky_(
+        BTM_CORR_MATRIX
+      );
+
+    let index = Number(
+      props.getProperty(
+        BTD_CONFIG.PROP_INDEX
+      ) || 0
+    );
+
+    const endIndex = Math.min(
+      index +
+      BTD_CONFIG.RACES_PER_BATCH,
+      dataset.length
+    );
+
+    const aggB =
+      btdReadAggregate_(
+        BTD_CONFIG.PROP_B
+      );
+
+    const aggD =
+      btdReadAggregate_(
+        BTD_CONFIG.PROP_D
+      );
+
+    for (
+      ;
+      index < endIndex;
+      index++
+    ) {
+      const race = dataset[index];
+
+      const baseWithoutVenue =
+        race.boats.map(
+          function(boat, i) {
+            return btmCalculateBaseScore_(
+              boat,
+              i + 1
+            );
+          }
+        );
+
+      const currentValues =
+        BTM_CURRENT_ADJUST[
+          race.venueCode
+        ] || [0, 0, 0, 0, 0, 0];
+
+      const hybridValues =
+        btdGetHybridAdjust_(
+          race.venueCode
+        );
+
+      const scoreSets = [
+        // B：全場で現行補正
+        baseWithoutVenue.map(
+          function(score, i) {
+            return (
+              score +
+              currentValues[i] *
+              BTD_CONFIG.VENUE_WEIGHT
+            );
+          }
+        ),
+
+        // D：指定5場だけ補正なし
+        baseWithoutVenue.map(
+          function(score, i) {
+            return (
+              score +
+              hybridValues[i] *
+              BTD_CONFIG.VENUE_WEIGHT
+            );
+          }
+        )
+      ];
+
+      const probabilitySets =
+        btmRunSharedMonteCarlo_(
+          scoreSets,
+          transform,
+          BTD_CONFIG.MC_TRIALS,
+          BTD_CONFIG.NOISE_SD,
+          race.raceId
+        );
+
+      btmUpdateAggregate_(
+        aggB,
+        probabilitySets[0],
+        race.firstLane
+      );
+
+      btmUpdateAggregate_(
+        aggD,
+        probabilitySets[1],
+        race.firstLane
+      );
+    }
+
+    props.setProperties({
+      [BTD_CONFIG.PROP_INDEX]:
+        String(index),
+
+      [BTD_CONFIG.PROP_TOTAL]:
+        String(dataset.length),
+
+      [BTD_CONFIG.PROP_MESSAGE]:
+        '処理済み=' +
+        index +
+        '/' +
+        dataset.length,
+
+      [BTD_CONFIG.PROP_B]:
+        JSON.stringify(aggB),
+
+      [BTD_CONFIG.PROP_D]:
+        JSON.stringify(aggD)
+    }, false);
+
+    if (index >= dataset.length) {
+      const report =
+        btdFinalizeComparison_(
+          aggB,
+          aggD
+        );
+
+      props.setProperty(
+        BTD_CONFIG.PROP_STATUS,
+        BTD_CONFIG.STATUS_COMPLETED
+      );
+
+      props.setProperty(
+        BTD_CONFIG.PROP_MESSAGE,
+        '比較完了'
+      );
+
+      btdDeleteTriggers_();
+
+      console.log(
+        JSON.stringify(report, null, 2)
+      );
+
+      return report;
+    }
+
+    btdScheduleNextTrigger_();
+
+    const result = {
+      status:
+        BTD_CONFIG.STATUS_RUNNING,
+
+      processed:
+        index,
+
+      total:
+        dataset.length,
+
+      progress:
+        dataset.length > 0
+          ? index / dataset.length
+          : 0,
+
+      nextBatchFrom:
+        index
+    };
+
+    console.log(
+      JSON.stringify(result, null, 2)
+    );
+
+    return result;
+
+  } catch (err) {
+    const props =
+      PropertiesService.getScriptProperties();
+
+    props.setProperty(
+      BTD_CONFIG.PROP_STATUS,
+      BTD_CONFIG.STATUS_FAILED
+    );
+
+    props.setProperty(
+      BTD_CONFIG.PROP_MESSAGE,
+      err.message
+    );
+
+    btdDeleteTriggers_();
+
+    throw err;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 状態確認。
+ */
+function btdCheckHoldoutComparisonStatus() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const index = Number(
+    props.getProperty(
+      BTD_CONFIG.PROP_INDEX
+    ) || 0
+  );
+
+  const total = Number(
+    props.getProperty(
+      BTD_CONFIG.PROP_TOTAL
+    ) || 0
+  );
+
+  const result = {
+    status:
+      props.getProperty(
+        BTD_CONFIG.PROP_STATUS
+      ) ||
+      BTD_CONFIG.STATUS_IDLE,
+
+    processed:
+      index,
+
+    total:
+      total,
+
+    progress:
+      total > 0
+        ? index / total
+        : 0,
+
+    message:
+      props.getProperty(
+        BTD_CONFIG.PROP_MESSAGE
+      ) || '',
+
+    startedAt:
+      props.getProperty(
+        BTD_CONFIG.PROP_STARTED_AT
+      ) || ''
+  };
+
+  console.log(
+    JSON.stringify(result, null, 2)
+  );
+
+  return result;
+}
+
+/**
+ * 手動停止。
+ */
+function btdStopHoldoutComparison() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  props.setProperty(
+    BTD_CONFIG.PROP_STATUS,
+    BTD_CONFIG.STATUS_STOPPED
+  );
+
+  props.setProperty(
+    BTD_CONFIG.PROP_MESSAGE,
+    'ユーザー操作で停止'
+  );
+
+  btdDeleteTriggers_();
+
+  return btdCheckHoldoutComparisonStatus();
+}
+
+/**
+ * 再開。
+ */
+function btdResumeHoldoutComparison() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const index =
+    props.getProperty(
+      BTD_CONFIG.PROP_INDEX
+    );
+
+  const total =
+    props.getProperty(
+      BTD_CONFIG.PROP_TOTAL
+    );
+
+  if (
+    index === null ||
+    total === null
+  ) {
+    throw new Error(
+      '再開可能な進捗情報がありません。'
+    );
+  }
+
+  props.setProperty(
+    BTD_CONFIG.PROP_STATUS,
+    BTD_CONFIG.STATUS_RUNNING
+  );
+
+  props.setProperty(
+    BTD_CONFIG.PROP_MESSAGE,
+    '比較を再開'
+  );
+
+  return btdRunHoldoutComparisonBatch();
+}
+
+/**
+ * Dモデルの補正値。
+ */
+function btdGetHybridAdjust_(venueCode) {
+  if (
+    BTD_NO_VENUE_CODES.indexOf(
+      venueCode
+    ) !== -1
+  ) {
+    return [0, 0, 0, 0, 0, 0];
+  }
+
+  return (
+    BTM_CURRENT_ADJUST[
+      venueCode
+    ] ||
+    [0, 0, 0, 0, 0, 0]
+  );
+}
+
+/**
+ * 完全未見期間の有効レースを読み込む。
+ */
+function btdLoadHoldoutDataset_() {
+  const ss =
+    SpreadsheetApp.openById(
+      BTD_CONFIG.SPREADSHEET_ID
+    );
+
+  const raceSheet =
+    btmRequireSheet_(
+      ss,
+      BTD_CONFIG.RACE_SHEET
+    );
+
+  const racerSheet =
+    btmRequireSheet_(
+      ss,
+      BTD_CONFIG.RACER_SHEET
+    );
+
+  const raceValues =
+    raceSheet
+      .getDataRange()
+      .getValues();
+
+  const racerValues =
+    racerSheet
+      .getDataRange()
+      .getValues();
+
+  const rh =
+    btmHeaderMap_(
+      raceValues[0],
+      [
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        '1着艇',
+        'Result有'
+      ],
+      BTD_CONFIG.RACE_SHEET
+    );
+
+  const bh =
+    btmHeaderMap_(
+      racerValues[0],
+      [
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        '艇番',
+        '級別番号',
+        'F数',
+        '平均ST',
+        '全国勝率',
+        '全国2連率',
+        '全国3連率',
+        '当地勝率',
+        '当地2連率',
+        '当地3連率',
+        'モーター2連率',
+        'モーター3連率',
+        'ボート2連率',
+        'ボート3連率',
+        '結果有',
+        '本番コース',
+        '着順'
+      ],
+      BTD_CONFIG.RACER_SHEET
+    );
+
+  const raceMap = {};
+
+  raceValues
+    .slice(1)
+    .forEach(function(row) {
+      const raceId =
+        String(
+          row[rh.Race_ID] || ''
+        ).trim();
+
+      if (!raceId) {
+        return;
+      }
+
+      const date =
+        btmDateText_(
+          row[rh['日付']]
+        );
+
+      if (
+        date < BTD_CONFIG.HOLDOUT_START ||
+        date > BTD_CONFIG.HOLDOUT_END
+      ) {
+        return;
+      }
+
+      const firstLane =
+        btmIntOrNull_(
+          row[rh['1着艇']]
+        );
+
+      if (
+        !btmBoolean_(
+          row[rh['Result有']]
+        ) ||
+        firstLane === null ||
+        firstLane < 1 ||
+        firstLane > 6
+      ) {
+        return;
+      }
+
+      raceMap[raceId] = {
+        raceId: raceId,
+
+        date: date,
+
+        venueCode:
+          btmPad2_(
+            row[rh['場コード']]
+          ),
+
+        venue:
+          String(
+            row[rh['場']] || ''
+          ).trim(),
+
+        firstLane: firstLane,
+
+        boats: []
+      };
+    });
+
+  racerValues
+    .slice(1)
+    .forEach(function(row) {
+      const raceId =
+        String(
+          row[bh.Race_ID] || ''
+        ).trim();
+
+      const race =
+        raceMap[raceId];
+
+      if (!race) {
+        return;
+      }
+
+      const date =
+        btmDateText_(
+          row[bh['日付']]
+        );
+
+      if (
+        date < BTD_CONFIG.HOLDOUT_START ||
+        date > BTD_CONFIG.HOLDOUT_END
+      ) {
+        return;
+      }
+
+      if (
+        !btmBoolean_(
+          row[bh['結果有']]
+        )
+      ) {
+        return;
+      }
+
+      const lane =
+        btmIntOrNull_(
+          row[bh['艇番']]
+        );
+
+      const resultCourse =
+        btmIntOrNull_(
+          row[bh['本番コース']]
+        );
+
+      const finish =
+        btmIntOrNull_(
+          row[bh['着順']]
+        );
+
+      if (
+        lane === null ||
+        resultCourse === null ||
+        finish === null
+      ) {
+        return;
+      }
+
+      race.boats.push({
+        lane: lane,
+
+        resultCourse:
+          resultCourse,
+
+        finish: finish,
+
+        className:
+          btmClassName_(
+            row[bh['級別番号']]
+          ),
+
+        flyingCount:
+          btmNumberOrNull_(
+            row[bh['F数']]
+          ),
+
+        avgSt:
+          btmNumberOrNull_(
+            row[bh['平均ST']]
+          ),
+
+        nationalWinRate:
+          btmNumberOrNull_(
+            row[bh['全国勝率']]
+          ),
+
+        national2Rate:
+          btmRateOrNull_(
+            row[bh['全国2連率']]
+          ),
+
+        national3Rate:
+          btmRateOrNull_(
+            row[bh['全国3連率']]
+          ),
+
+        localWinRate:
+          btmNumberOrNull_(
+            row[bh['当地勝率']]
+          ),
+
+        local2Rate:
+          btmRateOrNull_(
+            row[bh['当地2連率']]
+          ),
+
+        local3Rate:
+          btmRateOrNull_(
+            row[bh['当地3連率']]
+          ),
+
+        motor2Rate:
+          btmRateOrNull_(
+            row[bh['モーター2連率']]
+          ),
+
+        motor3Rate:
+          btmRateOrNull_(
+            row[bh['モーター3連率']]
+          ),
+
+        boat2Rate:
+          btmRateOrNull_(
+            row[bh['ボート2連率']]
+          ),
+
+        boat3Rate:
+          btmRateOrNull_(
+            row[bh['ボート3連率']]
+          )
+      });
+    });
+
+  return Object.keys(raceMap)
+    .map(function(key) {
+      return raceMap[key];
+    })
+    .filter(function(race) {
+      if (
+        race.boats.length !== 6
+      ) {
+        return false;
+      }
+
+      race.boats.sort(
+        function(a, b) {
+          return a.lane - b.lane;
+        }
+      );
+
+      const lanes =
+        race.boats.map(
+          function(boat) {
+            return boat.lane;
+          }
+        );
+
+      return [
+        1, 2, 3, 4, 5, 6
+      ].every(
+        function(lane, i) {
+          return lanes[i] === lane;
+        }
+      );
+    })
+    .sort(function(a, b) {
+      return a.raceId.localeCompare(
+        b.raceId
+      );
+    });
+}
+
+/**
+ * 集計値読み込み。
+ */
+function btdReadAggregate_(
+  propertyName
+) {
+  const text =
+    PropertiesService
+      .getScriptProperties()
+      .getProperty(
+        propertyName
+      );
+
+  return text
+    ? JSON.parse(text)
+    : btmNewAggregate_();
+}
+
+/**
+ * 最終集計。
+ */
+function btdFinalizeComparison_(
+  aggB,
+  aggD
+) {
+  const metrics = [
+    btmMetricRow_(
+      'B_CURRENT_V1',
+      aggB
+    ),
+
+    btmMetricRow_(
+      'D_HYBRID_V1',
+      aggD
+    )
+  ];
+
+  const runId =
+    Utilities.formatDate(
+      new Date(),
+      BTD_CONFIG.TIMEZONE,
+      'yyyyMMdd_HHmmss'
+    );
+
+  btdAppendReport_(
+    runId,
+    metrics,
+    [aggB, aggD]
+  );
+
+  const bestBrier =
+    metrics
+      .slice()
+      .sort(function(a, b) {
+        return a.brier - b.brier;
+      })[0];
+
+  const bestLogLoss =
+    metrics
+      .slice()
+      .sort(function(a, b) {
+        return a.logLoss - b.logLoss;
+      })[0];
+
+  const bestTop1 =
+    metrics
+      .slice()
+      .sort(function(a, b) {
+        return b.top1 - a.top1;
+      })[0];
+
+  const bestInBrier =
+    metrics
+      .slice()
+      .sort(function(a, b) {
+        return a.inBrier - b.inBrier;
+      })[0];
+
+  return {
+    status:
+      BTD_CONFIG.STATUS_COMPLETED,
+
+    runId: runId,
+
+    period:
+      BTD_CONFIG.HOLDOUT_START +
+      '～' +
+      BTD_CONFIG.HOLDOUT_END,
+
+    races:
+      metrics[0].n,
+
+    models:
+      metrics,
+
+    bestBrier:
+      bestBrier.model,
+
+    bestLogLoss:
+      bestLogLoss.model,
+
+    bestTop1Accuracy:
+      bestTop1.model,
+
+    bestInBrier:
+      bestInBrier.model,
+
+    adoptionRule:
+      'DがBrierとLog Lossの両方で改善すればD採用。片方のみ改善の場合は1号艇Brier・Calibration・改善幅を確認する。'
+  };
+}
+
+/**
+ * Parameter_Test末尾へ結果出力。
+ */
+function btdAppendReport_(
+  runId,
+  metrics,
+  aggregates
+) {
+  const ss =
+    SpreadsheetApp.openById(
+      BTD_CONFIG.SPREADSHEET_ID
+    );
+
+  const sheet =
+    btmRequireSheet_(
+      ss,
+      BTD_CONFIG.PARAMETER_SHEET
+    );
+
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    '期間区分',
+    '開始日',
+    '終了日',
+    'モデル名',
+    'Noise_SD',
+    'Venue_Weight',
+    'Correlation_Mode',
+    'MC_Trials',
+    '対象レース数',
+    'Top1_Accuracy',
+    'Brier_Score',
+    'Log_Loss',
+    '1号艇_Brier',
+    '例外会場',
+    '作成日時',
+    'Memo'
+  ];
+
+  const now = new Date();
+
+  const rows =
+    metrics.map(function(metric) {
+      return [
+        runId,
+        'HOLDOUT_B_VS_D',
+        'HOLDOUT_20260708_20260714',
+        BTD_CONFIG.HOLDOUT_START,
+        BTD_CONFIG.HOLDOUT_END,
+        metric.model,
+        BTD_CONFIG.NOISE_SD,
+        BTD_CONFIG.VENUE_WEIGHT,
+        BTD_CONFIG.CORRELATION_MODE,
+        BTD_CONFIG.MC_TRIALS,
+        metric.n,
+        metric.top1,
+        metric.brier,
+        metric.logLoss,
+        metric.inBrier,
+        (
+          metric.model ===
+          'D_HYBRID_V1'
+            ? BTD_NO_VENUE_CODES.join(',')
+            : ''
+        ),
+        now,
+        (
+          metric.model ===
+          'D_HYBRID_V1'
+            ? '桐生・戸田・江戸川・三国・びわこは会場補正なし。その他は現行補正。'
+            : '全24場で現行会場補正を使用。'
+        )
+      ];
+    });
+
+  const startRow =
+    sheet.getLastRow() + 2;
+
+  const calibrationStartRow =
+    startRow +
+    rows.length +
+    3;
+
+  const requiredLastRow =
+    calibrationStartRow +
+    10 *
+    metrics.length +
+    1;
+
+  if (
+    requiredLastRow >
+    sheet.getMaxRows()
+  ) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredLastRow -
+      sheet.getMaxRows()
+    );
+  }
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      1,
+      headers.length
+    )
+    .setValues([headers])
+    .setFontWeight('bold')
+    .setBackground('#D9EAD3');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      1,
+      rows.length,
+      headers.length
+    )
+    .setValues(rows);
+
+  sheet
+    .getRange(
+      startRow + 1,
+      12,
+      rows.length,
+      1
+    )
+    .setNumberFormat('0.00%');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      13,
+      rows.length,
+      3
+    )
+    .setNumberFormat('0.0000');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      17,
+      rows.length,
+      1
+    )
+    .setNumberFormat(
+      'yyyy-mm-dd hh:mm:ss'
+    );
+
+  const calibrationHeaders = [
+    'Run_ID',
+    'Report_Type',
+    'モデル名',
+    '1号艇確率帯',
+    '件数',
+    '平均予測確率',
+    '実勝率',
+    '差'
+  ];
+
+  const calibrationRows = [];
+
+  aggregates.forEach(
+    function(agg, modelIndex) {
+      agg.bins.forEach(
+        function(bin, i) {
+          const avgProb =
+            bin.n > 0
+              ? bin.probSum / bin.n
+              : 0;
+
+          const actualRate =
+            bin.n > 0
+              ? bin.winSum / bin.n
+              : 0;
+
+          calibrationRows.push([
+            runId,
+            'HOLDOUT_IN_CALIBRATION',
+            metrics[
+              modelIndex
+            ].model,
+            (
+              i * 10 +
+              '-' +
+              (i + 1) * 10 +
+              '%'
+            ),
+            bin.n,
+            avgProb,
+            actualRate,
+            actualRate - avgProb
+          ]);
+        }
+      );
+    }
+  );
+
+  sheet
+    .getRange(
+      calibrationStartRow,
+      1,
+      1,
+      calibrationHeaders.length
+    )
+    .setValues([
+      calibrationHeaders
+    ])
+    .setFontWeight('bold')
+    .setBackground('#FFF2CC');
+
+  sheet
+    .getRange(
+      calibrationStartRow + 1,
+      1,
+      calibrationRows.length,
+      calibrationHeaders.length
+    )
+    .setValues(
+      calibrationRows
+    );
+
+  sheet
+    .getRange(
+      calibrationStartRow + 1,
+      6,
+      calibrationRows.length,
+      3
+    )
+    .setNumberFormat('0.00%');
+
+  SpreadsheetApp.flush();
+}
+
+/**
+ * 次バッチ予約。
+ */
+function btdScheduleNextTrigger_() {
+  btdDeleteTriggers_();
+
+  ScriptApp
+    .newTrigger(
+      BTD_CONFIG.TRIGGER_FUNCTION
+    )
+    .timeBased()
+    .after(
+      BTD_CONFIG.NEXT_TRIGGER_MINUTES *
+      60 *
+      1000
+    )
+    .create();
+}
+
+/**
+ * B対D用トリガーだけ削除。
+ */
+function btdDeleteTriggers_() {
+  ScriptApp
+    .getProjectTriggers()
+    .forEach(function(trigger) {
+      if (
+        trigger.getHandlerFunction() ===
+        BTD_CONFIG.TRIGGER_FUNCTION
+      ) {
+        ScriptApp.deleteTrigger(
+          trigger
+        );
+      }
+    });
+}
 

@@ -1,1 +1,597 @@
+/**
+ * BoatRace Venue Adjust Candidate Builder v1.0.0
+ * ------------------------------------------------------------
+ * 目的:
+ *   5月データだけで会場補正候補を作り、
+ *   6月データでは値を調整せず方向再現性だけを検証する。
+ *
+ * 過学習対策:
+ *   - DEVELOPMENT_2026-05 だけで候補生成
+ *   - VALIDATION_2026-06 は検証専用
+ *   - 5〜6月合算値は候補生成に使わない
+ *   - 小標本は全場平均へ縮小
+ *   - 1回の実行で係数を本番へ反映しない
+ *
+ * 使用シート:
+ *   Parameter_Test
+ *
+ * 実行関数:
+ *   btvBuildVenueAdjustCandidate()
+ */
+
+const BTV_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+  SHEET_NAME: 'Parameter_Test',
+  TIMEZONE: 'Asia/Tokyo',
+
+  SOURCE_RUN_ID: '20260717_084153',
+  DEVELOPMENT_PERIOD: 'DEVELOPMENT_2026-05',
+  VALIDATION_PERIOD: 'VALIDATION_2026-06',
+
+  // 平滑化。大きいほど会場固有値を弱める。
+  SHRINKAGE_K: 200,
+
+  // logit差をGASスコアへ変換する暫定倍率。
+  // 候補生成用であり、本番採用値ではない。
+  SCORE_SCALE: 20,
+
+  // 極端値を防ぐ。
+  MAX_ABS_SCORE: 24,
+
+  // 方向一致判定の無視帯。
+  NEUTRAL_SCORE_BAND: 2,
+
+  CURRENT_ADJUST: Object.freeze({
+    '01': [-12, 0,  4,  8,  5,  2],
+    '02': [-18, 0, 10, 18, 14,  6],
+    '03': [-20, 0,  8, 16, 12,  8],
+    '04': [  0, 0,  0,  0,  0,  0],
+    '05': [ 10, 0, -4, -6, -8,-10],
+    '06': [  2, 0,  0,  2,  0,  0],
+    '07': [ 14, 0, -5, -8,-10,-12],
+    '08': [ 10, 0, -4, -6, -8,-10],
+    '09': [  4, 0,  0,  0,  0,  0],
+    '10': [ -8, 0,  4,  8,  6,  2],
+    '11': [ -6, 0,  6, 12,  8,  2],
+    '12': [  2, 0,  0,  2,  0,  0],
+    '13': [ 12, 0, -4, -8,-10,-12],
+    '14': [ 14, 0, -4, -6,-10,-12],
+    '15': [  6, 0,  0,  0,  0,  0],
+    '16': [ 16, 0, -6,-10,-12,-14],
+    '17': [ 20, 0, -8,-12,-16,-18],
+    '18': [ 18, 0, -6,-10,-12,-14],
+    '19': [  4, 0,  0,  0,  0,  0],
+    '20': [  0, 0,  4,  6,  4,  2],
+    '21': [ 16, 0, -6,-10,-12,-14],
+    '22': [ -8, 0,  6, 10,  8,  4],
+    '23': [ 10, 0, -4, -6, -8,-10],
+    '24': [ 24, 0, -8,-12,-16,-20]
+  })
+});
+
+function btvBuildVenueAdjustCandidate() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.openById(
+      BTV_CONFIG.SPREADSHEET_ID
+    );
+    const sheet = ss.getSheetByName(
+      BTV_CONFIG.SHEET_NAME
+    );
+
+    if (!sheet) {
+      throw new Error(
+        'シートがありません: ' +
+        BTV_CONFIG.SHEET_NAME
+      );
+    }
+
+    const values = sheet.getDataRange().getValues();
+    const sourceRows = btvReadSourceRows_(values);
+
+    const development = sourceRows.filter(function(row) {
+      return row.period === BTV_CONFIG.DEVELOPMENT_PERIOD;
+    });
+
+    const validation = sourceRows.filter(function(row) {
+      return row.period === BTV_CONFIG.VALIDATION_PERIOD;
+    });
+
+    if (development.length !== 144) {
+      throw new Error(
+        '5月の会場×コース行が144行ではありません。実際=' +
+        development.length
+      );
+    }
+
+    if (validation.length !== 144) {
+      throw new Error(
+        '6月の会場×コース行が144行ではありません。実際=' +
+        validation.length
+      );
+    }
+
+    const devGlobal = btvBuildGlobalByCourse_(development);
+    const valGlobal = btvBuildGlobalByCourse_(validation);
+
+    const validationMap = {};
+    validation.forEach(function(row) {
+      validationMap[row.venueCode + '_' + row.course] = row;
+    });
+
+    const output = development.map(function(dev) {
+      const val = validationMap[
+        dev.venueCode + '_' + dev.course
+      ];
+
+      if (!val) {
+        throw new Error(
+          '6月の対応行がありません: ' +
+          dev.venueCode + '_' + dev.course
+        );
+      }
+
+      const devBase = devGlobal[dev.course];
+      const valBase = valGlobal[val.course];
+
+      const devRawLogitDiff =
+        btvLogit_(dev.winRate) -
+        btvLogit_(devBase.winRate);
+
+      const valRawLogitDiff =
+        btvLogit_(val.winRate) -
+        btvLogit_(valBase.winRate);
+
+      const devShrink =
+        dev.starts /
+        (dev.starts + BTV_CONFIG.SHRINKAGE_K);
+
+      const valShrink =
+        val.starts /
+        (val.starts + BTV_CONFIG.SHRINKAGE_K);
+
+      const devShrunkDiff =
+        devRawLogitDiff * devShrink;
+
+      const valShrunkDiff =
+        valRawLogitDiff * valShrink;
+
+      const candidateScore = btvRoundClamp_(
+        devShrunkDiff * BTV_CONFIG.SCORE_SCALE,
+        -BTV_CONFIG.MAX_ABS_SCORE,
+        BTV_CONFIG.MAX_ABS_SCORE
+      );
+
+      const validationScore = btvRoundClamp_(
+        valShrunkDiff * BTV_CONFIG.SCORE_SCALE,
+        -BTV_CONFIG.MAX_ABS_SCORE,
+        BTV_CONFIG.MAX_ABS_SCORE
+      );
+
+      const directionStatus =
+        btvDirectionStatus_(
+          candidateScore,
+          validationScore
+        );
+
+      const currentValues =
+        BTV_CONFIG.CURRENT_ADJUST[
+          dev.venueCode
+        ] || [0, 0, 0, 0, 0, 0];
+
+      const currentScore =
+        currentValues[dev.course - 1];
+
+      const candidateVsCurrent =
+        candidateScore - currentScore;
+
+      return {
+        venueCode: dev.venueCode,
+        venue: dev.venue,
+        course: dev.course,
+
+        devStarts: dev.starts,
+        devWinRate: dev.winRate,
+        devGlobalWinRate: devBase.winRate,
+        devDiff: dev.winRate - devBase.winRate,
+        devShrink: devShrink,
+        candidateScore: candidateScore,
+
+        valStarts: val.starts,
+        valWinRate: val.winRate,
+        valGlobalWinRate: valBase.winRate,
+        valDiff: val.winRate - valBase.winRate,
+        validationScore: validationScore,
+
+        directionStatus: directionStatus,
+        currentScore: currentScore,
+        candidateVsCurrent: candidateVsCurrent,
+
+        recommendation:
+          btvRecommendation_(
+            directionStatus,
+            candidateScore,
+            validationScore,
+            currentScore,
+            dev.starts,
+            val.starts
+          )
+      };
+    });
+
+    const runId = Utilities.formatDate(
+      new Date(),
+      BTV_CONFIG.TIMEZONE,
+      'yyyyMMdd_HHmmss'
+    );
+
+    btvAppendReport_(sheet, runId, output);
+
+    const consistent = output.filter(function(x) {
+      return x.directionStatus === 'CONSISTENT';
+    }).length;
+
+    const neutral = output.filter(function(x) {
+      return x.directionStatus === 'NEUTRAL';
+    }).length;
+
+    const reversed = output.filter(function(x) {
+      return x.directionStatus === 'REVERSED';
+    }).length;
+
+    const venue1Rows = output.filter(function(x) {
+      return x.course === 1;
+    });
+
+    const venue1Consistent = venue1Rows.filter(function(x) {
+      return x.directionStatus === 'CONSISTENT';
+    }).length;
+
+    const result = {
+      status: 'COMPLETED',
+      runId: runId,
+      sourceRunId: BTV_CONFIG.SOURCE_RUN_ID,
+      rows: output.length,
+      directionConsistent: consistent,
+      directionNeutral: neutral,
+      directionReversed: reversed,
+      course1ConsistentVenues: venue1Consistent,
+      note:
+        '候補値は5月のみで生成。6月は方向再現性の検証だけに使用。'
+    };
+
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Parameter_Test内の追記セクションを列位置で読む。
+ *
+ * A Run_ID
+ * B Report_Type
+ * C Period
+ * D Start_Date
+ * E End_Date
+ * F 場コード
+ * G 場
+ * H コース
+ * I 出走数
+ * J 1着数
+ * K 1着率
+ */
+function btvReadSourceRows_(values) {
+  const output = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+
+    if (
+      String(row[0] || '').trim() !==
+      BTV_CONFIG.SOURCE_RUN_ID
+    ) {
+      continue;
+    }
+
+    if (
+      String(row[1] || '').trim() !==
+      'VENUE_COURSE_STATS'
+    ) {
+      continue;
+    }
+
+    const period = String(row[2] || '').trim();
+
+    if (
+      period !== BTV_CONFIG.DEVELOPMENT_PERIOD &&
+      period !== BTV_CONFIG.VALIDATION_PERIOD
+    ) {
+      continue;
+    }
+
+    output.push({
+      period: period,
+      venueCode: btvPad2_(row[5]),
+      venue: String(row[6] || '').trim(),
+      course: btvInt_(row[7]),
+      starts: btvNumber_(row[8]),
+      wins: btvNumber_(row[9]),
+      winRate: btvRate_(row[10])
+    });
+  }
+
+  return output;
+}
+
+function btvBuildGlobalByCourse_(rows) {
+  const sums = {};
+
+  for (let course = 1; course <= 6; course++) {
+    sums[course] = {
+      starts: 0,
+      wins: 0,
+      winRate: 0
+    };
+  }
+
+  rows.forEach(function(row) {
+    sums[row.course].starts += row.starts;
+    sums[row.course].wins += row.wins;
+  });
+
+  Object.keys(sums).forEach(function(key) {
+    const x = sums[key];
+    x.winRate =
+      x.starts > 0
+        ? x.wins / x.starts
+        : 0;
+  });
+
+  return sums;
+}
+
+function btvDirectionStatus_(devScore, valScore) {
+  const band = BTV_CONFIG.NEUTRAL_SCORE_BAND;
+
+  if (
+    Math.abs(devScore) <= band ||
+    Math.abs(valScore) <= band
+  ) {
+    return 'NEUTRAL';
+  }
+
+  return Math.sign(devScore) === Math.sign(valScore)
+    ? 'CONSISTENT'
+    : 'REVERSED';
+}
+
+function btvRecommendation_(
+  status,
+  candidate,
+  validation,
+  current,
+  devStarts,
+  valStarts
+) {
+  if (
+    devStarts < 30 ||
+    valStarts < 30
+  ) {
+    return 'HOLD_SMALL_SAMPLE';
+  }
+
+  if (status === 'REVERSED') {
+    return 'REJECT';
+  }
+
+  if (status === 'NEUTRAL') {
+    return 'HOLD';
+  }
+
+  const sameAsCurrentDirection =
+    Math.abs(current) <= 2 ||
+    Math.sign(current) === Math.sign(candidate);
+
+  if (!sameAsCurrentDirection) {
+    return 'REVIEW_CURRENT_DIRECTION';
+  }
+
+  if (
+    Math.abs(candidate - current) >= 10
+  ) {
+    return 'REVIEW_MAGNITUDE';
+  }
+
+  return 'CANDIDATE';
+}
+
+function btvAppendReport_(sheet, runId, rows) {
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    'Source_Run_ID',
+    '場コード',
+    '場',
+    'コース',
+
+    '5月出走数',
+    '5月勝率',
+    '5月全場平均',
+    '5月平均との差',
+    'Shrinkage',
+    'V2候補スコア',
+
+    '6月出走数',
+    '6月勝率',
+    '6月全場平均',
+    '6月平均との差',
+    '6月参考スコア',
+
+    '方向再現性',
+    '現行スコア',
+    '候補-現行',
+    '推奨'
+  ];
+
+  const values = rows.map(function(x) {
+    return [
+      runId,
+      'VENUE_ADJUST_CANDIDATE',
+      BTV_CONFIG.SOURCE_RUN_ID,
+      x.venueCode,
+      x.venue,
+      x.course,
+
+      x.devStarts,
+      x.devWinRate,
+      x.devGlobalWinRate,
+      x.devDiff,
+      x.devShrink,
+      x.candidateScore,
+
+      x.valStarts,
+      x.valWinRate,
+      x.valGlobalWinRate,
+      x.valDiff,
+      x.validationScore,
+
+      x.directionStatus,
+      x.currentScore,
+      x.candidateVsCurrent,
+      x.recommendation
+    ];
+  });
+
+  const startRow = sheet.getLastRow() + 2;
+  const requiredLastRow =
+    startRow + values.length;
+
+  if (requiredLastRow > sheet.getMaxRows()) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredLastRow - sheet.getMaxRows()
+    );
+  }
+
+  sheet
+    .getRange(startRow, 1, 1, headers.length)
+    .setValues([headers])
+    .setFontWeight('bold')
+    .setBackground('#E2F0D9');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      1,
+      values.length,
+      headers.length
+    )
+    .setValues(values);
+
+  sheet
+    .getRange(
+      startRow + 1,
+      8,
+      values.length,
+      4
+    )
+    .setNumberFormat('0.0%');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      14,
+      values.length,
+      3
+    )
+    .setNumberFormat('0.0%');
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      values.length + 1,
+      headers.length
+    )
+    .setWrap(true);
+
+  SpreadsheetApp.flush();
+}
+
+function btvLogit_(p) {
+  const epsilon = 0.0001;
+  const clipped = Math.max(
+    epsilon,
+    Math.min(1 - epsilon, p)
+  );
+
+  return Math.log(
+    clipped / (1 - clipped)
+  );
+}
+
+function btvRoundClamp_(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, Math.round(value))
+  );
+}
+
+function btvRate_(value) {
+  if (typeof value === 'number') {
+    return value > 1.5
+      ? value / 100
+      : value;
+  }
+
+  const text = String(value || '')
+    .replace('%', '')
+    .trim();
+
+  const number = Number(text);
+
+  if (!Number.isFinite(number)) {
+    throw new Error(
+      '率を数値化できません: ' + value
+    );
+  }
+
+  return String(value).indexOf('%') >= 0 ||
+    number > 1.5
+      ? number / 100
+      : number;
+}
+
+function btvNumber_(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    throw new Error(
+      '数値化できません: ' + value
+    );
+  }
+
+  return number;
+}
+
+function btvInt_(value) {
+  const number = parseInt(value, 10);
+
+  if (!Number.isFinite(number)) {
+    throw new Error(
+      '整数化できません: ' + value
+    );
+  }
+
+  return number;
+}
+
+function btvPad2_(value) {
+  return String(parseInt(value, 10))
+    .padStart(2, '0');
+}
 

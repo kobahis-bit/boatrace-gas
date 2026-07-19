@@ -1,1 +1,1166 @@
+/**
+ * BoatRace Racer Master Builder v1.0.0
+ * ------------------------------------------------------------
+ * Backtest_Racer の確定結果から Racer_Master（選手図鑑 Ver.1）を再構築する。
+ *
+ * 主目的:
+ * - 選手ごとの全体成績
+ * - 1〜6コース別成績
+ * - 相対ST
+ * - サンプル補正済みコース指数
+ * - イン信頼指数 / ST指数 / Fリスク / 信頼度
+ *
+ * 重要:
+ * - 着順・本番コース・本番STが揃った確定結果だけを使用
+ * - 小標本は全体平均へ縮小する
+ * - 差し/まくり/まくり差し指数は決まり手データ未取得のため作らない
+ * - Racer_Master は毎回全件再構築する
+ *
+ * 実行関数:
+ *   buildRacerMasterV1()
+ *
+ * 確認関数:
+ *   checkRacerMasterV1()
+ */
+
+const RM_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  SOURCE_SHEET: 'Backtest_Racer',
+  OUTPUT_SHEET: 'Racer_Master',
+
+  TIMEZONE: 'Asia/Tokyo',
+
+  // 小標本を全体平均へ縮小する強さ
+  COURSE_PRIOR_N: 30,
+  OVERALL_PRIOR_N: 60,
+
+  // 指数の中心と拡大率
+  INDEX_CENTER: 50,
+  INDEX_SCALE: 18,
+
+  // 信頼度
+  CONFIDENCE_FULL_N: 120,
+  COURSE_CONFIDENCE_FULL_N: 40,
+
+  // ST異常値除外
+  MIN_VALID_ST: -0.20,
+  MAX_VALID_ST: 0.50
+});
+
+/**
+ * Racer_Master を全件再構築する。
+ */
+function buildRacerMasterV1() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.openById(
+      RM_CONFIG.SPREADSHEET_ID
+    );
+
+    const source = rmRequireSheet_(
+      ss,
+      RM_CONFIG.SOURCE_SHEET
+    );
+
+    const values = source.getDataRange().getValues();
+
+    if (values.length < 2) {
+      throw new Error('Backtest_Racer にデータがありません。');
+    }
+
+    const h = rmHeaderMap_(
+      values[0],
+      [
+        'Race_ID',
+        '日付',
+        '選手名',
+        '選手番号',
+        '級別番号',
+        '支部番号',
+        'F数',
+        '結果有',
+        '本番コース',
+        '本番ST',
+        '着順'
+      ],
+      RM_CONFIG.SOURCE_SHEET
+    );
+
+    // 同一レース内の相対ST計算用
+    const raceStMap = rmBuildRaceStMap_(
+      values,
+      h
+    );
+
+    const racers = {};
+    const global = rmNewGlobalAggregate_();
+
+    values.slice(1).forEach(function(row) {
+      if (!rmBoolean_(row[h['結果有']])) {
+        return;
+      }
+
+      const racerNo = rmText_(row[h['選手番号']]);
+      const racerName = rmText_(row[h['選手名']]);
+      const raceId = rmText_(row[h['Race_ID']]);
+      const course = rmIntOrNull_(row[h['本番コース']]);
+      const finish = rmIntOrNull_(row[h['着順']]);
+      const st = rmNumberOrNull_(row[h['本番ST']]);
+
+      if (
+        !racerNo ||
+        !raceId ||
+        course === null ||
+        course < 1 ||
+        course > 6 ||
+        finish === null ||
+        finish < 1 ||
+        finish > 6
+      ) {
+        return;
+      }
+
+      const dateText = rmDateText_(row[h['日付']]);
+      const className = rmClassName_(row[h['級別番号']]);
+      const branchNo = rmText_(row[h['支部番号']]);
+      const flyingCount = rmNumberOrNull_(row[h['F数']]);
+
+      if (!racers[racerNo]) {
+        racers[racerNo] = rmNewRacerAggregate_(
+          racerNo,
+          racerName
+        );
+      }
+
+      const racer = racers[racerNo];
+
+      // 最新情報を残す
+      if (!racer.lastDate || dateText >= racer.lastDate) {
+        racer.name = racerName || racer.name;
+        racer.className = className;
+        racer.branchNo = branchNo;
+        racer.currentFlyingCount =
+          flyingCount === null ? 0 : flyingCount;
+        racer.lastDate = dateText;
+      }
+
+      const validSt = rmValidSt_(st);
+      const raceSt = raceStMap[raceId];
+      const relativeSt =
+        validSt !== null &&
+        raceSt &&
+        raceSt.n >= 2
+          ? validSt - raceSt.avg
+          : null;
+
+      rmUpdateAggregate_(
+        racer.overall,
+        finish,
+        validSt,
+        relativeSt
+      );
+
+      rmUpdateAggregate_(
+        racer.courses[course - 1],
+        finish,
+        validSt,
+        relativeSt
+      );
+
+      rmUpdateAggregate_(
+        global.overall,
+        finish,
+        validSt,
+        relativeSt
+      );
+
+      rmUpdateAggregate_(
+        global.courses[course - 1],
+        finish,
+        validSt,
+        relativeSt
+      );
+    });
+
+    const globalMetrics = rmBuildGlobalMetrics_(global);
+
+    const rows = Object.keys(racers)
+      .map(function(racerNo) {
+        return rmBuildOutputRow_(
+          racers[racerNo],
+          globalMetrics
+        );
+      })
+      .sort(function(a, b) {
+        // 選手番号で昇順
+        return String(a[0]).localeCompare(
+          String(b[0]),
+          'ja',
+          {numeric: true}
+        );
+      });
+
+    const headers = rmHeaders_();
+
+    let output = ss.getSheetByName(
+      RM_CONFIG.OUTPUT_SHEET
+    );
+
+    if (!output) {
+      output = ss.insertSheet(
+        RM_CONFIG.OUTPUT_SHEET
+      );
+    }
+
+    output.clear();
+
+    const requiredRows = Math.max(
+      rows.length + 1,
+      2
+    );
+    const requiredCols = headers.length;
+
+    if (output.getMaxRows() < requiredRows) {
+      output.insertRowsAfter(
+        output.getMaxRows(),
+        requiredRows - output.getMaxRows()
+      );
+    }
+
+    if (output.getMaxColumns() < requiredCols) {
+      output.insertColumnsAfter(
+        output.getMaxColumns(),
+        requiredCols - output.getMaxColumns()
+      );
+    }
+
+    output
+      .getRange(1, 1, 1, headers.length)
+      .setValues([headers])
+      .setFontWeight('bold')
+      .setBackground('#0B57D0')
+      .setFontColor('#FFFFFF');
+
+    if (rows.length > 0) {
+      output
+        .getRange(
+          2,
+          1,
+          rows.length,
+          headers.length
+        )
+        .setValues(rows);
+    }
+
+    rmFormatOutput_(output, rows.length, headers);
+
+    SpreadsheetApp.flush();
+
+    const result = {
+      status: 'COMPLETED',
+      racers: rows.length,
+      sourceRows: values.length - 1,
+      outputSheet: RM_CONFIG.OUTPUT_SHEET,
+      priorN: RM_CONFIG.COURSE_PRIOR_N,
+      createdAt: Utilities.formatDate(
+        new Date(),
+        RM_CONFIG.TIMEZONE,
+        'yyyy-MM-dd HH:mm:ss'
+      )
+    };
+
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 出力状態を確認する。
+ */
+function checkRacerMasterV1() {
+  const ss = SpreadsheetApp.openById(
+    RM_CONFIG.SPREADSHEET_ID
+  );
+
+  const sheet = ss.getSheetByName(
+    RM_CONFIG.OUTPUT_SHEET
+  );
+
+  if (!sheet) {
+    const result = {
+      status: 'NOT_BUILT',
+      message: 'Racer_Master がありません。'
+    };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  const result = {
+    status: 'READY',
+    rows: Math.max(0, sheet.getLastRow() - 1),
+    columns: sheet.getLastColumn(),
+    lastCell:
+      sheet.getLastRow() > 0
+        ? sheet.getRange(1, 1).getDisplayValue()
+        : ''
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function rmBuildRaceStMap_(values, h) {
+  const temp = {};
+
+  values.slice(1).forEach(function(row) {
+    if (!rmBoolean_(row[h['結果有']])) {
+      return;
+    }
+
+    const raceId = rmText_(row[h['Race_ID']]);
+    const st = rmValidSt_(
+      rmNumberOrNull_(row[h['本番ST']])
+    );
+
+    if (!raceId || st === null) {
+      return;
+    }
+
+    if (!temp[raceId]) {
+      temp[raceId] = {
+        n: 0,
+        sum: 0
+      };
+    }
+
+    temp[raceId].n++;
+    temp[raceId].sum += st;
+  });
+
+  const result = {};
+
+  Object.keys(temp).forEach(function(raceId) {
+    const x = temp[raceId];
+    result[raceId] = {
+      n: x.n,
+      avg: x.n > 0 ? x.sum / x.n : null
+    };
+  });
+
+  return result;
+}
+
+function rmNewGlobalAggregate_() {
+  return {
+    overall: rmNewAggregate_(),
+    courses: Array.from(
+      {length: 6},
+      function() {
+        return rmNewAggregate_();
+      }
+    )
+  };
+}
+
+function rmNewRacerAggregate_(racerNo, racerName) {
+  return {
+    racerNo: racerNo,
+    name: racerName,
+    className: '',
+    branchNo: '',
+    currentFlyingCount: 0,
+    lastDate: '',
+    overall: rmNewAggregate_(),
+    courses: Array.from(
+      {length: 6},
+      function() {
+        return rmNewAggregate_();
+      }
+    )
+  };
+}
+
+function rmNewAggregate_() {
+  return {
+    n: 0,
+    win: 0,
+    top2: 0,
+    top3: 0,
+    finishSum: 0,
+    stN: 0,
+    stSum: 0,
+    stSqSum: 0,
+    relativeStN: 0,
+    relativeStSum: 0
+  };
+}
+
+function rmUpdateAggregate_(
+  agg,
+  finish,
+  st,
+  relativeSt
+) {
+  agg.n++;
+
+  if (finish === 1) {
+    agg.win++;
+  }
+  if (finish <= 2) {
+    agg.top2++;
+  }
+  if (finish <= 3) {
+    agg.top3++;
+  }
+
+  agg.finishSum += finish;
+
+  if (st !== null) {
+    agg.stN++;
+    agg.stSum += st;
+    agg.stSqSum += st * st;
+  }
+
+  if (relativeSt !== null) {
+    agg.relativeStN++;
+    agg.relativeStSum += relativeSt;
+  }
+}
+
+function rmBuildGlobalMetrics_(global) {
+  return {
+    overall: rmMetrics_(global.overall),
+    courses: global.courses.map(function(x) {
+      return rmMetrics_(x);
+    })
+  };
+}
+
+function rmMetrics_(agg) {
+  const avgSt =
+    agg.stN > 0
+      ? agg.stSum / agg.stN
+      : null;
+
+  let stSd = null;
+
+  if (agg.stN >= 2) {
+    const variance = Math.max(
+      0,
+      agg.stSqSum / agg.stN -
+      avgSt * avgSt
+    );
+    stSd = Math.sqrt(variance);
+  }
+
+  return {
+    n: agg.n,
+    winRate:
+      agg.n > 0 ? agg.win / agg.n : 0,
+    top2Rate:
+      agg.n > 0 ? agg.top2 / agg.n : 0,
+    top3Rate:
+      agg.n > 0 ? agg.top3 / agg.n : 0,
+    avgFinish:
+      agg.n > 0 ? agg.finishSum / agg.n : null,
+    avgSt: avgSt,
+    stSd: stSd,
+    relativeSt:
+      agg.relativeStN > 0
+        ? agg.relativeStSum / agg.relativeStN
+        : null
+  };
+}
+
+function rmBuildOutputRow_(
+  racer,
+  globalMetrics
+) {
+  const overall = rmMetrics_(racer.overall);
+
+  const courseMetrics = racer.courses.map(
+    function(x) {
+      return rmMetrics_(x);
+    }
+  );
+
+  const overallWinShrunk = rmShrink_(
+    overall.winRate,
+    overall.n,
+    globalMetrics.overall.winRate,
+    RM_CONFIG.OVERALL_PRIOR_N
+  );
+
+  const overallTop2Shrunk = rmShrink_(
+    overall.top2Rate,
+    overall.n,
+    globalMetrics.overall.top2Rate,
+    RM_CONFIG.OVERALL_PRIOR_N
+  );
+
+  const overallRelativeSt = rmShrink_(
+    overall.relativeSt === null
+      ? 0
+      : overall.relativeSt,
+    overall.relativeSt === null
+      ? 0
+      : overall.n,
+    globalMetrics.overall.relativeSt === null
+      ? 0
+      : globalMetrics.overall.relativeSt,
+    RM_CONFIG.OVERALL_PRIOR_N
+  );
+
+  const courseIndices = [];
+  const courseShrunkWin = [];
+  const courseShrunkTop2 = [];
+
+  courseMetrics.forEach(function(metric, i) {
+    const prior = globalMetrics.courses[i];
+
+    const shrunkWin = rmShrink_(
+      metric.winRate,
+      metric.n,
+      prior.winRate,
+      RM_CONFIG.COURSE_PRIOR_N
+    );
+
+    const shrunkTop2 = rmShrink_(
+      metric.top2Rate,
+      metric.n,
+      prior.top2Rate,
+      RM_CONFIG.COURSE_PRIOR_N
+    );
+
+    const shrunkRelativeSt = rmShrink_(
+      metric.relativeSt === null
+        ? 0
+        : metric.relativeSt,
+      metric.relativeSt === null
+        ? 0
+        : metric.n,
+      prior.relativeSt === null
+        ? 0
+        : prior.relativeSt,
+      RM_CONFIG.COURSE_PRIOR_N
+    );
+
+    courseShrunkWin.push(shrunkWin);
+    courseShrunkTop2.push(shrunkTop2);
+
+    const winDelta = rmSafeDivide_(
+      shrunkWin - prior.winRate,
+      Math.max(0.04, prior.winRate)
+    );
+
+    const top2Delta = rmSafeDivide_(
+      shrunkTop2 - prior.top2Rate,
+      Math.max(0.08, prior.top2Rate)
+    );
+
+    // STは小さいほど良い。0.01秒差を適度に反映。
+    const stComponent =
+      -shrunkRelativeSt / 0.015;
+
+    const raw =
+      winDelta * 0.55 +
+      top2Delta * 0.30 +
+      stComponent * 0.15;
+
+    courseIndices.push(
+      rmIndexFromRaw_(raw)
+    );
+  });
+
+  const inIndex = courseIndices[0];
+
+  const globalRelativeSt =
+    globalMetrics.overall.relativeSt === null
+      ? 0
+      : globalMetrics.overall.relativeSt;
+
+  const stRaw =
+    -(overallRelativeSt - globalRelativeSt) /
+    0.015;
+
+  const stIndex = rmIndexFromRaw_(stRaw);
+
+  const fRisk = rmBuildFRisk_(
+    racer.currentFlyingCount,
+    overall.avgSt,
+    overall.stSd
+  );
+
+  const confidence = rmClamp_(
+    overall.n /
+    RM_CONFIG.CONFIDENCE_FULL_N,
+    0,
+    1
+  );
+
+  const courseConfidences =
+    courseMetrics.map(function(metric) {
+      return rmClamp_(
+        metric.n /
+        RM_CONFIG.COURSE_CONFIDENCE_FULL_N,
+        0,
+        1
+      );
+    });
+
+  const bestCourseIndex =
+    rmArgMax_(courseIndices);
+
+  const worstCourseIndex =
+    rmArgMin_(courseIndices);
+
+  const summary = rmBuildSummary_(
+    racer,
+    overall,
+    inIndex,
+    stIndex,
+    fRisk,
+    courseIndices,
+    bestCourseIndex,
+    worstCourseIndex,
+    confidence
+  );
+
+  const row = [
+    racer.racerNo,
+    racer.name,
+    racer.className,
+    racer.branchNo,
+    racer.lastDate,
+    overall.n,
+    overall.winRate,
+    overall.top2Rate,
+    overall.top3Rate,
+    overall.avgFinish,
+    overall.avgSt,
+    overall.stSd,
+    overall.relativeSt,
+    overallWinShrunk,
+    overallTop2Shrunk,
+    inIndex,
+    stIndex,
+    fRisk,
+    confidence,
+    bestCourseIndex + 1,
+    worstCourseIndex + 1,
+    summary
+  ];
+
+  courseMetrics.forEach(function(metric, i) {
+    row.push(
+      metric.n,
+      metric.winRate,
+      metric.top2Rate,
+      metric.top3Rate,
+      metric.avgFinish,
+      metric.avgSt,
+      metric.relativeSt,
+      courseShrunkWin[i],
+      courseShrunkTop2[i],
+      courseIndices[i],
+      courseConfidences[i]
+    );
+  });
+
+  row.push(
+    'racer_master_v1.0.0',
+    Utilities.formatDate(
+      new Date(),
+      RM_CONFIG.TIMEZONE,
+      'yyyy-MM-dd HH:mm:ss'
+    )
+  );
+
+  return row;
+}
+
+function rmHeaders_() {
+  const headers = [
+    '選手番号',
+    '選手名',
+    '級別',
+    '支部番号',
+    '最終出走日',
+    '総出走数',
+    '全体1着率',
+    '全体2連率',
+    '全体3連率',
+    '平均着順',
+    '平均ST',
+    'ST標準偏差',
+    '相対ST',
+    '補正後全体1着率',
+    '補正後全体2連率',
+    'イン信頼指数',
+    'ST指数',
+    'Fリスク',
+    '総合信頼度',
+    '得意コース',
+    '苦手コース',
+    'AI要約'
+  ];
+
+  for (let course = 1; course <= 6; course++) {
+    headers.push(
+      course + 'C_出走数',
+      course + 'C_1着率',
+      course + 'C_2連率',
+      course + 'C_3連率',
+      course + 'C_平均着順',
+      course + 'C_平均ST',
+      course + 'C_相対ST',
+      course + 'C_補正後1着率',
+      course + 'C_補正後2連率',
+      course + 'C_指数',
+      course + 'C_信頼度'
+    );
+  }
+
+  headers.push(
+    'モデル版',
+    '更新日時'
+  );
+
+  return headers;
+}
+
+function rmBuildFRisk_(
+  currentFlyingCount,
+  avgSt,
+  stSd
+) {
+  let risk = 15;
+
+  risk += rmClamp_(
+    Number(currentFlyingCount || 0) * 30,
+    0,
+    60
+  );
+
+  if (avgSt !== null) {
+    // 速すぎる平均STはリスク加点
+    risk += rmClamp_(
+      (0.16 - avgSt) * 180,
+      0,
+      20
+    );
+  }
+
+  if (stSd !== null) {
+    risk += rmClamp_(
+      (stSd - 0.045) * 220,
+      0,
+      15
+    );
+  }
+
+  return Math.round(
+    rmClamp_(risk, 0, 100)
+  );
+}
+
+function rmBuildSummary_(
+  racer,
+  overall,
+  inIndex,
+  stIndex,
+  fRisk,
+  courseIndices,
+  bestCourseIndex,
+  worstCourseIndex,
+  confidence
+) {
+  const parts = [];
+
+  if (confidence < 0.35) {
+    parts.push('標本少なめ');
+  } else if (confidence >= 0.75) {
+    parts.push('データ信頼度高め');
+  }
+
+  if (inIndex >= 65) {
+    parts.push('イン信頼型');
+  } else if (inIndex <= 40) {
+    parts.push('イン過信注意');
+  }
+
+  if (stIndex >= 65) {
+    parts.push('相対ST優秀');
+  } else if (stIndex <= 40) {
+    parts.push('STやや遅め');
+  }
+
+  if (fRisk >= 60) {
+    parts.push('Fリスク高め');
+  }
+
+  if (
+    courseIndices[bestCourseIndex] >= 60
+  ) {
+    parts.push(
+      (bestCourseIndex + 1) +
+      'コース得意'
+    );
+  }
+
+  if (
+    courseIndices[worstCourseIndex] <= 40
+  ) {
+    parts.push(
+      (worstCourseIndex + 1) +
+      'コース苦手'
+    );
+  }
+
+  if (parts.length === 0) {
+    parts.push('全体平均型');
+  }
+
+  return parts.join('・');
+}
+
+function rmFormatOutput_(
+  sheet,
+  dataRows,
+  headers
+) {
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(2);
+  sheet.setHiddenGridlines(true);
+
+  if (dataRows <= 0) {
+    return;
+  }
+
+  const headerMap = {};
+  headers.forEach(function(name, i) {
+    headerMap[name] = i + 1;
+  });
+
+  // 日付
+  sheet
+    .getRange(
+      2,
+      headerMap['最終出走日'],
+      dataRows,
+      1
+    )
+    .setNumberFormat('yyyy-mm-dd');
+
+  // 率
+  const percentHeaders = [
+    '全体1着率',
+    '全体2連率',
+    '全体3連率',
+    '補正後全体1着率',
+    '補正後全体2連率',
+    '総合信頼度'
+  ];
+
+  for (let course = 1; course <= 6; course++) {
+    percentHeaders.push(
+      course + 'C_1着率',
+      course + 'C_2連率',
+      course + 'C_3連率',
+      course + 'C_補正後1着率',
+      course + 'C_補正後2連率',
+      course + 'C_信頼度'
+    );
+  }
+
+  percentHeaders.forEach(function(name) {
+    if (headerMap[name]) {
+      sheet
+        .getRange(
+          2,
+          headerMap[name],
+          dataRows,
+          1
+        )
+        .setNumberFormat('0.0%');
+    }
+  });
+
+  // ST
+  headers.forEach(function(name, i) {
+    if (
+      name === '平均ST' ||
+      name === 'ST標準偏差' ||
+      name === '相対ST' ||
+      /C_平均ST$/.test(name) ||
+      /C_相対ST$/.test(name)
+    ) {
+      sheet
+        .getRange(2, i + 1, dataRows, 1)
+        .setNumberFormat('0.000');
+    }
+  });
+
+  // 指数
+  headers.forEach(function(name, i) {
+    if (
+      /指数$/.test(name) ||
+      name === 'Fリスク'
+    ) {
+      sheet
+        .getRange(2, i + 1, dataRows, 1)
+        .setNumberFormat('0');
+    }
+  });
+
+  sheet.autoResizeColumns(
+    1,
+    Math.min(headers.length, 22)
+  );
+
+  // AI要約は広め
+  if (headerMap['AI要約']) {
+    sheet.setColumnWidth(
+      headerMap['AI要約'],
+      280
+    );
+  }
+
+  const filter = sheet.getFilter();
+  if (filter) {
+    filter.remove();
+  }
+
+  sheet
+    .getRange(
+      1,
+      1,
+      dataRows + 1,
+      headers.length
+    )
+    .createFilter();
+}
+
+function rmShrink_(
+  observed,
+  n,
+  prior,
+  priorN
+) {
+  const safeObserved =
+    Number.isFinite(observed)
+      ? observed
+      : prior;
+
+  return (
+    safeObserved * n +
+    prior * priorN
+  ) / (n + priorN);
+}
+
+function rmIndexFromRaw_(raw) {
+  return Math.round(
+    rmClamp_(
+      RM_CONFIG.INDEX_CENTER +
+      raw * RM_CONFIG.INDEX_SCALE,
+      0,
+      100
+    )
+  );
+}
+
+function rmArgMax_(values) {
+  let best = 0;
+
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] > values[best]) {
+      best = i;
+    }
+  }
+
+  return best;
+}
+
+function rmArgMin_(values) {
+  let best = 0;
+
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] < values[best]) {
+      best = i;
+    }
+  }
+
+  return best;
+}
+
+function rmSafeDivide_(a, b) {
+  return b === 0 ? 0 : a / b;
+}
+
+function rmValidSt_(value) {
+  if (
+    value === null ||
+    !Number.isFinite(value) ||
+    value < RM_CONFIG.MIN_VALID_ST ||
+    value > RM_CONFIG.MAX_VALID_ST
+  ) {
+    return null;
+  }
+
+  return value;
+}
+
+function rmHeaderMap_(
+  headers,
+  required,
+  sheetName
+) {
+  const map = {};
+
+  headers.forEach(function(value, index) {
+    map[rmText_(value)] = index;
+  });
+
+  required.forEach(function(name) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        map,
+        name
+      )
+    ) {
+      throw new Error(
+        sheetName +
+        'に必須列がありません: ' +
+        name
+      );
+    }
+  });
+
+  return map;
+}
+
+function rmRequireSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error(
+      'シートがありません: ' + name
+    );
+  }
+
+  return sheet;
+}
+
+function rmDateText_(value) {
+  if (
+    value instanceof Date &&
+    !isNaN(value.getTime())
+  ) {
+    return Utilities.formatDate(
+      value,
+      RM_CONFIG.TIMEZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  const match = rmText_(value).match(
+    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/
+  );
+
+  if (!match) {
+    return '';
+  }
+
+  return [
+    match[1],
+    ('0' + match[2]).slice(-2),
+    ('0' + match[3]).slice(-2)
+  ].join('-');
+}
+
+function rmClassName_(value) {
+  const map = {
+    1: 'A1',
+    2: 'A2',
+    3: 'B1',
+    4: 'B2'
+  };
+
+  return map[
+    parseInt(value, 10)
+  ] || '';
+}
+
+function rmBoolean_(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const text = rmText_(value).toLowerCase();
+
+  return (
+    text === 'true' ||
+    text === '1' ||
+    text === 'yes'
+  );
+}
+
+function rmNumberOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number = Number(
+    String(value)
+      .replace(/,/g, '')
+      .replace('%', '')
+      .trim()
+  );
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function rmIntOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number = parseInt(value, 10);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function rmText_(value) {
+  return String(
+    value === null ||
+    value === undefined
+      ? ''
+      : value
+  ).trim();
+}
+
+function rmClamp_(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
+}
 

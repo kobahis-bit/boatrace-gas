@@ -1,0 +1,1767 @@
+/**
+ * BoatRace Morning Monte Carlo - Standalone GAS v1.0.0
+ * D_HYBRID_V1・Logic_Settings・選手名・登録番号対応版
+ * -----------------------------------------------------
+ * 独立型 Apps Script から BoatRace Open API の当日番組を取得し、
+ * Logic_Settingsで検証済みの設定を使ってMonte Carloを実行し、
+ * GAS_Probability_Logへ既存43列＋選手情報12列を追記します。
+ *
+ * 主な実行関数
+ * - checkLogicSettingsReady
+ * - checkMorningMonteCarloReady
+ * - runMorningMonteCarlo
+ * - debugTodayApiStructure
+ *
+ * 重要:
+ * - Logic_Settings異常時は直書き値へフォールバックせず停止
+ * - ENABLE_EXHIBITION=falseを必須とし、朝モデルに展示補正を入れない
+ * - D_HYBRID_V1では桐生・戸田・江戸川・三国・びわこだけ会場補正を0にする
+ * - 既存43列の列名・列順は維持し、右端へ選手情報12列を追加
+ */
+
+const CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1NL17ds0Dwu01lo92Zcm68J3VhZLWwjChLVAYEJQJ_Hc',
+  OUTPUT_SHEET: 'GAS_Probability_Log',
+  LOGIC_SETTINGS_SHEET: 'Logic_Settings',
+  API_URL: 'https://boatraceopenapi.github.io/programs/v3/today.json',
+  TIMEZONE: 'Asia/Tokyo',
+  PHASE: '朝',
+  REQUEST_TIMEOUT_MS: 30000,
+  OVERWRITE_SAME_ID: false,
+  REQUIRE_API_DATE_IS_TODAY: true,
+  AUTO_FORMAT_OUTPUT_SHEET: true
+});
+
+const REQUIRED_LOGIC_KEYS = Object.freeze([
+  'MODEL_VERSION',
+  'MC_TRIALS',
+  'NOISE_SD',
+  'VENUE_WEIGHT',
+  'CORRELATION_MODE',
+  'ENABLE_EXHIBITION',
+  'VENUE_MODEL',
+  'NO_VENUE_CODES'
+]);
+
+const SUPPORTED_SETTING_TYPES = Object.freeze([
+  'text',
+  'integer',
+  'number',
+  'percent',
+  'boolean'
+]);
+
+const SUPPORTED_CORRELATION_MODES = Object.freeze([
+  'none',
+  'fixed_cholesky_v1'
+]);
+
+const SUPPORTED_VENUE_MODELS = Object.freeze([
+  'CURRENT_V1',
+  'D_HYBRID_V1'
+]);
+
+const OUTPUT_HEADERS = Object.freeze([
+  'Probability_ID','Race_ID','日付','場コード','場','R','締切','Phase','Calculated_At','MC_Trials',
+  'Model_Version','Venue_Adjust_Weight','Correlation_Model',
+  '1_1着率','2_1着率','3_1着率','4_1着率','5_1着率','6_1着率',
+  '1_2着率','2_2着率','3_2着率','4_2着率','5_2着率','6_2着率',
+  '1_3着率','2_3着率','3_3着率','4_3着率','5_3着率','6_3着率',
+  'Best_2連単','Best_2連単確率','Best_2連複','Best_2連複確率','Best_3連複','Best_3連複確率',
+  '1号艇1着推定','1号艇敗退推定','モデル集中度','Screening_Type','Selected_For_Review','Memo',
+  '1号艇選手名','1号艇登録番号',
+  '2号艇選手名','2号艇登録番号',
+  '3号艇選手名','3号艇登録番号',
+  '4号艇選手名','4号艇登録番号',
+  '5号艇選手名','5号艇登録番号',
+  '6号艇選手名','6号艇登録番号'
+]);
+
+const CORR_MATRIX = Object.freeze([
+  [ 1.000, -0.098,  0.000,  0.000,  0.000,  0.000],
+  [-0.098,  1.000, -0.340,  0.000,  0.000,  0.000],
+  [ 0.000, -0.340,  1.000,  0.000, -0.274,  0.000],
+  [ 0.000,  0.000,  0.000,  1.000,  0.000,  0.000],
+  [ 0.000,  0.000, -0.274,  0.000,  1.000,  0.041],
+  [ 0.000,  0.000,  0.000,  0.000,  0.041,  1.000]
+]);
+
+const VENUE_ADJUST = Object.freeze({
+  '01': {name:'桐生',   values:[-12, 0,  4,  8,  5,  2]},
+  '02': {name:'戸田',   values:[-18, 0, 10, 18, 14,  6]},
+  '03': {name:'江戸川', values:[-20, 0,  8, 16, 12,  8]},
+  '04': {name:'平和島', values:[  0, 0,  0,  0,  0,  0]},
+  '05': {name:'多摩川', values:[ 10, 0, -4, -6, -8,-10]},
+  '06': {name:'浜名湖', values:[  2, 0,  0,  2,  0,  0]},
+  '07': {name:'蒲郡',   values:[ 14, 0, -5, -8,-10,-12]},
+  '08': {name:'常滑',   values:[ 10, 0, -4, -6, -8,-10]},
+  '09': {name:'津',     values:[  4, 0,  0,  0,  0,  0]},
+  '10': {name:'三国',   values:[ -8, 0,  4,  8,  6,  2]},
+  '11': {name:'びわこ', values:[ -6, 0,  6, 12,  8,  2]},
+  '12': {name:'住之江', values:[  2, 0,  0,  2,  0,  0]},
+  '13': {name:'尼崎',   values:[ 12, 0, -4, -8,-10,-12]},
+  '14': {name:'鳴門',   values:[ 14, 0, -4, -6,-10,-12]},
+  '15': {name:'丸亀',   values:[  6, 0,  0,  0,  0,  0]},
+  '16': {name:'児島',   values:[ 16, 0, -6,-10,-12,-14]},
+  '17': {name:'宮島',   values:[ 20, 0, -8,-12,-16,-18]},
+  '18': {name:'徳山',   values:[ 18, 0, -6,-10,-12,-14]},
+  '19': {name:'下関',   values:[  4, 0,  0,  0,  0,  0]},
+  '20': {name:'若松',   values:[  0, 0,  4,  6,  4,  2]},
+  '21': {name:'芦屋',   values:[ 16, 0, -6,-10,-12,-14]},
+  '22': {name:'福岡',   values:[ -8, 0,  6, 10,  8,  4]},
+  '23': {name:'唐津',   values:[ 10, 0, -4, -6, -8,-10]},
+  '24': {name:'大村',   values:[ 24, 0, -8,-12,-16,-20]}
+});
+
+const VENUE_NAME_TO_CODE = Object.freeze(
+  Object.keys(VENUE_ADJUST).reduce(function(acc, code) {
+    acc[VENUE_ADJUST[code].name] = code;
+    return acc;
+  }, {})
+);
+
+const CLASS_POINTS = Object.freeze({A1:8, A2:6, B1:3, B2:1});
+
+function runMorningMonteCarlo() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    validateStaticConfig_();
+
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const settings = loadLogicSettings_(ss);
+    validateMorningModelSettings_(settings);
+
+    const payload = fetchJson_(CONFIG.API_URL);
+    const races = normalizeTodayRaces_(payload);
+
+    if (!races.length) {
+      throw new Error(
+        'APIからレースを抽出できませんでした。' +
+        'debugTodayApiStructure を実行してログを確認してください。'
+      );
+    }
+
+    validateApiRaceDate_(races);
+
+    const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+    if (!sheet) {
+      throw new Error('出力シートがありません: ' + CONFIG.OUTPUT_SHEET);
+    }
+
+    verifyHeaders_(sheet);
+
+    if (CONFIG.AUTO_FORMAT_OUTPUT_SHEET) {
+      setupOutputSheetFormat_(sheet);
+    }
+
+    const existing = readExistingIds_(sheet);
+    const noiseTransform = buildNoiseTransform_(settings.CORRELATION_MODE);
+    const now = new Date();
+    const rows = [];
+    const errors = [];
+
+    races.forEach(function(race) {
+      try {
+        if (!race.boats || race.boats.length !== 6) {
+          errors.push(race.venueName + race.raceNo + 'R: 艇データが6艇ではありません');
+          return;
+        }
+
+        const identityErrors = validateBoatIdentities_(race.boats);
+        if (identityErrors.length) {
+          errors.push(
+            race.venueName +
+            race.raceNo +
+            'R: 選手情報異常 - ' +
+            identityErrors.join(', ')
+          );
+          return;
+        }
+
+        const probabilityId = buildProbabilityId_(race, settings);
+
+        if (existing.has(probabilityId) && !CONFIG.OVERWRITE_SAME_ID) {
+          return;
+        }
+
+        const baseScores = race.boats.map(function(boat, idx) {
+          return calculateBaseScore_(boat, idx + 1, race.venueCode, settings);
+        });
+
+        const result = runMonteCarlo_(
+          baseScores,
+          noiseTransform,
+          settings.MC_TRIALS,
+          settings.NOISE_SD
+        );
+
+        const summary = summarizeResult_(result);
+
+        rows.push(
+          buildOutputRow_(
+            race,
+            probabilityId,
+            now,
+            summary,
+            baseScores,
+            settings
+          )
+        );
+      } catch (err) {
+        errors.push(
+          (race.venueName || '?') +
+          (race.raceNo || '?') +
+          'R: ' +
+          err.message
+        );
+      }
+    });
+
+    if (rows.length) {
+      const startRow = findLastProbabilityDataRow_(sheet) + 1;
+      const writeRange = sheet.getRange(
+        startRow,
+        1,
+        rows.length,
+        OUTPUT_HEADERS.length
+      );
+
+      writeRange.setValues(rows);
+      SpreadsheetApp.flush();
+
+      const writtenIds = sheet
+        .getRange(startRow, 1, rows.length, 1)
+        .getDisplayValues()
+        .filter(function(row) {
+          return String(row[0] || '').trim() !== '';
+        })
+        .length;
+
+      if (writtenIds !== rows.length) {
+        throw new Error(
+          '書き込み確認に失敗しました。予定=' +
+          rows.length +
+          '件 / 確認=' +
+          writtenIds +
+          '件'
+        );
+      }
+
+      const lastColumnLetter = columnNumberToLetter_(OUTPUT_HEADERS.length);
+
+      console.log(
+        '書き込み範囲: ' +
+        CONFIG.OUTPUT_SHEET +
+        '!A' +
+        startRow +
+        ':' +
+        lastColumnLetter +
+        (startRow + rows.length - 1)
+      );
+    }
+
+    const resultSummary = {
+      status: 'COMPLETED',
+      modelVersion: settings.MODEL_VERSION,
+      mcTrials: settings.MC_TRIALS,
+      noiseSd: settings.NOISE_SD,
+      venueWeight: settings.VENUE_WEIGHT,
+      venueModel: settings.VENUE_MODEL,
+      noVenueCodes: settings.NO_VENUE_CODES,
+      correlationMode: settings.CORRELATION_MODE,
+      enableExhibition: settings.ENABLE_EXHIBITION,
+      totalRaces: races.length,
+      inserted: rows.length,
+      skipped: races.length - rows.length,
+      errors: errors
+    };
+
+    console.log(JSON.stringify(resultSummary, null, 2));
+    return resultSummary;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function checkLogicSettingsReady() {
+  validateStaticConfig_();
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const settings = loadLogicSettings_(ss);
+  validateMorningModelSettings_(settings);
+
+  const result = {
+    status: 'READY',
+    spreadsheet: ss.getName(),
+    settingsSheet: CONFIG.LOGIC_SETTINGS_SHEET,
+    modelVersion: settings.MODEL_VERSION,
+    mcTrials: settings.MC_TRIALS,
+    noiseSd: settings.NOISE_SD,
+    venueWeight: settings.VENUE_WEIGHT,
+    venueModel: settings.VENUE_MODEL,
+    noVenueCodes: settings.NO_VENUE_CODES,
+    correlationMode: settings.CORRELATION_MODE,
+    enableExhibition: settings.ENABLE_EXHIBITION,
+    enabledKeys: Object.keys(settings).sort()
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function checkMorningMonteCarloReady() {
+  validateStaticConfig_();
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const settings = loadLogicSettings_(ss);
+  validateMorningModelSettings_(settings);
+
+  const payload = fetchJson_(CONFIG.API_URL);
+  const races = normalizeTodayRaces_(payload);
+
+  if (!races.length) {
+    throw new Error('レースを抽出できませんでした。');
+  }
+
+  validateApiRaceDate_(races);
+
+  const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+  if (!sheet) {
+    throw new Error('出力シートがありません: ' + CONFIG.OUTPUT_SHEET);
+  }
+
+  verifyHeaders_(sheet);
+
+  if (CONFIG.AUTO_FORMAT_OUTPUT_SHEET) {
+    setupOutputSheetFormat_(sheet);
+  }
+
+  const firstRace = races[0];
+  const identityErrors = validateBoatIdentities_(firstRace.boats);
+
+  if (identityErrors.length) {
+    throw new Error(
+      '先頭レースの選手情報に異常があります: ' +
+      identityErrors.join(', ')
+    );
+  }
+
+  const result = {
+    status: 'READY',
+    spreadsheet: ss.getName(),
+    sheet: sheet.getName(),
+    settingsSheet: CONFIG.LOGIC_SETTINGS_SHEET,
+    apiRaceDate: firstRace.raceDateText,
+    totalRaces: races.length,
+    firstRace: firstRace.venueName + firstRace.raceNo + 'R',
+    firstDeadline: firstRace.deadline,
+    firstRaceBoats: firstRace.boats.map(function(boat) {
+      return {
+        lane: boat.lane,
+        racerName: boat.racerName,
+        racerNumber: boat.racerNumber
+      };
+    }),
+    modelVersion: settings.MODEL_VERSION,
+    mcTrials: settings.MC_TRIALS,
+    noiseSd: settings.NOISE_SD,
+    venueWeight: settings.VENUE_WEIGHT,
+    venueModel: settings.VENUE_MODEL,
+    noVenueCodes: settings.NO_VENUE_CODES,
+    correlationMode: settings.CORRELATION_MODE,
+    enableExhibition: settings.ENABLE_EXHIBITION,
+    oddsFetch: false
+  };
+
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function loadLogicSettings_(ss) {
+  const sheet = ss.getSheetByName(CONFIG.LOGIC_SETTINGS_SHEET);
+
+  if (!sheet) {
+    throw new Error('Logic_Settingsシートがありません: ' + CONFIG.LOGIC_SETTINGS_SHEET);
+  }
+
+  const values = sheet.getDataRange().getValues();
+
+  if (values.length < 2) {
+    throw new Error('Logic_Settingsに設定行がありません。');
+  }
+
+  const headers = values[0].map(function(value) {
+    return String(value || '').trim();
+  });
+
+  const requiredHeaders = [
+    'Key','Value','Type','Min','Max','Enabled','Description','Updated_At'
+  ];
+
+  const headerIndex = {};
+
+  requiredHeaders.forEach(function(header) {
+    const index = headers.indexOf(header);
+    if (index === -1) {
+      throw new Error('Logic_Settingsに必須列がありません: ' + header);
+    }
+    headerIndex[header] = index;
+  });
+
+  const settings = {};
+  const seenKeys = new Set();
+  const duplicateKeys = [];
+
+  for (let rowIndex = 1; rowIndex < values.length; rowIndex++) {
+    const row = values[rowIndex];
+    const sheetRow = rowIndex + 1;
+    const key = String(row[headerIndex.Key] || '').trim();
+
+    if (!key) continue;
+
+    if (seenKeys.has(key)) {
+      duplicateKeys.push(key + '（' + sheetRow + '行目）');
+      continue;
+    }
+
+    seenKeys.add(key);
+
+    const enabled = parseBoolean_(
+      row[headerIndex.Enabled],
+      'Enabled',
+      key,
+      sheetRow
+    );
+
+    if (!enabled) continue;
+
+    const type = String(row[headerIndex.Type] || '').trim().toLowerCase();
+
+    if (SUPPORTED_SETTING_TYPES.indexOf(type) === -1) {
+      throw new Error(
+        'Logic_Settings ' +
+        sheetRow +
+        '行目: 未対応Typeです。Key=' +
+        key +
+        ' / Type=' +
+        type
+      );
+    }
+
+    const convertedValue = convertSettingValue_(
+      row[headerIndex.Value],
+      type,
+      key,
+      sheetRow
+    );
+
+    const minValue = parseBoundaryValue_(
+      row[headerIndex.Min],
+      type,
+      key,
+      sheetRow,
+      'Min'
+    );
+
+    const maxValue = parseBoundaryValue_(
+      row[headerIndex.Max],
+      type,
+      key,
+      sheetRow,
+      'Max'
+    );
+
+    validateSettingRange_(
+      convertedValue,
+      minValue,
+      maxValue,
+      type,
+      key,
+      sheetRow
+    );
+
+    settings[key] = convertedValue;
+  }
+
+  if (duplicateKeys.length) {
+    throw new Error('Logic_Settingsに重複Keyがあります: ' + duplicateKeys.join(', '));
+  }
+
+  REQUIRED_LOGIC_KEYS.forEach(function(key) {
+    if (!Object.prototype.hasOwnProperty.call(settings, key)) {
+      throw new Error('Logic_Settingsに有効な必須Keyがありません: ' + key);
+    }
+  });
+
+  // NO_VENUE_CODESはLogic_Settings上ではtextだが、実行中は正規化済み配列として扱う。
+  settings.NO_VENUE_CODES = normalizeVenueCodeList_(settings.NO_VENUE_CODES);
+
+  console.log('Logic_Settings読込結果:\n' + JSON.stringify(settings, null, 2));
+  return Object.freeze(settings);
+}
+
+function convertSettingValue_(rawValue, type, key, sheetRow) {
+  switch (type) {
+    case 'text': {
+      const value = String(
+        rawValue === null || rawValue === undefined ? '' : rawValue
+      ).trim();
+
+      if (!value) {
+        throw new Error(
+          'Logic_Settings ' + sheetRow + '行目: text値が空です。Key=' + key
+        );
+      }
+
+      return value;
+    }
+
+    case 'integer': {
+      const number = parseStrictNumber_(rawValue, key, sheetRow, 'Value');
+
+      if (!Number.isInteger(number)) {
+        throw new Error(
+          'Logic_Settings ' +
+          sheetRow +
+          '行目: integerではありません。Key=' +
+          key +
+          ' / Value=' +
+          rawValue
+        );
+      }
+
+      return number;
+    }
+
+    case 'number':
+      return parseStrictNumber_(rawValue, key, sheetRow, 'Value');
+
+    case 'percent':
+      return parsePercent_(rawValue, key, sheetRow, 'Value');
+
+    case 'boolean':
+      return parseBoolean_(rawValue, 'Value', key, sheetRow);
+
+    default:
+      throw new Error('未対応Typeです。Key=' + key + ' / Type=' + type);
+  }
+}
+
+function parseBoundaryValue_(rawValue, type, key, sheetRow, label) {
+  if (rawValue === '' || rawValue === null || rawValue === undefined) {
+    return null;
+  }
+
+  if (type === 'integer' || type === 'number') {
+    return parseStrictNumber_(rawValue, key, sheetRow, label);
+  }
+
+  if (type === 'percent') {
+    return parsePercent_(rawValue, key, sheetRow, label);
+  }
+
+  return null;
+}
+
+function validateSettingRange_(value, minValue, maxValue, type, key, sheetRow) {
+  if (type !== 'integer' && type !== 'number' && type !== 'percent') {
+    return;
+  }
+
+  if (minValue !== null && maxValue !== null && minValue > maxValue) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: MinがMaxを超えています。Key=' +
+      key +
+      ' / Min=' +
+      minValue +
+      ' / Max=' +
+      maxValue
+    );
+  }
+
+  if (minValue !== null && value < minValue) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: ValueがMin未満です。Key=' +
+      key +
+      ' / Value=' +
+      value +
+      ' / Min=' +
+      minValue
+    );
+  }
+
+  if (maxValue !== null && value > maxValue) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: ValueがMax超過です。Key=' +
+      key +
+      ' / Value=' +
+      value +
+      ' / Max=' +
+      maxValue
+    );
+  }
+}
+
+function parseStrictNumber_(rawValue, key, sheetRow, label) {
+  if (rawValue === '' || rawValue === null || rawValue === undefined) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: ' +
+      label +
+      'が空です。Key=' +
+      key
+    );
+  }
+
+  const normalized = String(rawValue).replace(/,/g, '').trim();
+  const number = Number(normalized);
+
+  if (!Number.isFinite(number)) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: 数値へ変換できません。Key=' +
+      key +
+      ' / ' +
+      label +
+      '=' +
+      rawValue
+    );
+  }
+
+  return number;
+}
+
+function parsePercent_(rawValue, key, sheetRow, label) {
+  if (rawValue === '' || rawValue === null || rawValue === undefined) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: ' +
+      label +
+      'が空です。Key=' +
+      key
+    );
+  }
+
+  if (typeof rawValue === 'number') {
+    if (!Number.isFinite(rawValue)) {
+      throw new Error(
+        'Logic_Settings ' + sheetRow + '行目: percent値が不正です。Key=' + key
+      );
+    }
+    return rawValue > 1 ? rawValue / 100 : rawValue;
+  }
+
+  const text = String(rawValue).trim();
+  const hasPercentMark = text.indexOf('%') !== -1;
+  const number = Number(text.replace('%', '').replace(/,/g, '').trim());
+
+  if (!Number.isFinite(number)) {
+    throw new Error(
+      'Logic_Settings ' +
+      sheetRow +
+      '行目: percentへ変換できません。Key=' +
+      key +
+      ' / ' +
+      label +
+      '=' +
+      rawValue
+    );
+  }
+
+  return hasPercentMark || number > 1 ? number / 100 : number;
+}
+
+function parseBoolean_(rawValue, label, key, sheetRow) {
+  if (typeof rawValue === 'boolean') return rawValue;
+  if (rawValue === 1) return true;
+  if (rawValue === 0) return false;
+
+  const normalized = String(rawValue || '').trim().toLowerCase();
+
+  if (
+    normalized === 'true' ||
+    normalized === 'yes' ||
+    normalized === 'y' ||
+    normalized === '1'
+  ) {
+    return true;
+  }
+
+  if (
+    normalized === 'false' ||
+    normalized === 'no' ||
+    normalized === 'n' ||
+    normalized === '0'
+  ) {
+    return false;
+  }
+
+  throw new Error(
+    'Logic_Settings ' +
+    sheetRow +
+    '行目: booleanへ変換できません。Key=' +
+    key +
+    ' / ' +
+    label +
+    '=' +
+    rawValue
+  );
+}
+
+function validateMorningModelSettings_(settings) {
+  if (settings.MC_TRIALS < 1000) {
+    throw new Error('MC_TRIALSは1000以上にしてください。現在=' + settings.MC_TRIALS);
+  }
+
+  if (settings.NOISE_SD <= 0) {
+    throw new Error('NOISE_SDは0より大きくしてください。現在=' + settings.NOISE_SD);
+  }
+
+  if (settings.VENUE_WEIGHT < 0 || settings.VENUE_WEIGHT > 1) {
+    throw new Error('VENUE_WEIGHTは0〜1の範囲にしてください。現在=' + settings.VENUE_WEIGHT);
+  }
+
+  if (SUPPORTED_CORRELATION_MODES.indexOf(settings.CORRELATION_MODE) === -1) {
+    throw new Error('未対応のCORRELATION_MODEです: ' + settings.CORRELATION_MODE);
+  }
+
+  if (SUPPORTED_VENUE_MODELS.indexOf(settings.VENUE_MODEL) === -1) {
+    throw new Error('未対応のVENUE_MODELです: ' + settings.VENUE_MODEL);
+  }
+
+  if (!Array.isArray(settings.NO_VENUE_CODES)) {
+    throw new Error('NO_VENUE_CODESの内部変換に失敗しました。');
+  }
+
+  settings.NO_VENUE_CODES.forEach(function(code) {
+    if (!Object.prototype.hasOwnProperty.call(VENUE_ADJUST, code)) {
+      throw new Error('NO_VENUE_CODESに未登録の場コードがあります: ' + code);
+    }
+  });
+
+  if (
+    settings.VENUE_MODEL === 'D_HYBRID_V1' &&
+    settings.NO_VENUE_CODES.length === 0
+  ) {
+    throw new Error('D_HYBRID_V1ではNO_VENUE_CODESを1件以上設定してください。');
+  }
+
+  if (
+    settings.VENUE_MODEL === 'CURRENT_V1' &&
+    settings.NO_VENUE_CODES.length > 0
+  ) {
+    throw new Error(
+      'CURRENT_V1ではNO_VENUE_CODESを空にしてください。現在=' +
+      settings.NO_VENUE_CODES.join(',')
+    );
+  }
+
+  if (settings.ENABLE_EXHIBITION !== false) {
+    throw new Error(
+      '朝モデルではENABLE_EXHIBITIONをFALSEにしてください。' +
+      '展示補正は未検証のため本番処理を停止しました。'
+    );
+  }
+}
+
+function normalizeVenueCodeList_(rawValue) {
+  const text = Array.isArray(rawValue)
+    ? rawValue.join(',')
+    : String(rawValue === null || rawValue === undefined ? '' : rawValue);
+
+  const codes = text
+    .split(',')
+    .map(function(value) {
+      return String(value || '').trim();
+    })
+    .filter(function(value) {
+      return value !== '';
+    })
+    .map(function(value) {
+      if (!/^\d{1,2}$/.test(value)) {
+        throw new Error('NO_VENUE_CODESの形式が不正です: ' + value);
+      }
+      return String(parseInt(value, 10)).padStart(2, '0');
+    });
+
+  const unique = [];
+  const seen = new Set();
+
+  codes.forEach(function(code) {
+    if (seen.has(code)) {
+      throw new Error('NO_VENUE_CODESに重複があります: ' + code);
+    }
+    seen.add(code);
+    unique.push(code);
+  });
+
+  return Object.freeze(unique);
+}
+
+function getVenueAdjustValues_(venueCode, settings) {
+  const code = String(venueCode || '').padStart(2, '0');
+  const venue = VENUE_ADJUST[code];
+
+  if (!venue) {
+    throw new Error('会場補正表に未登録の場コードです: ' + code);
+  }
+
+  if (
+    settings.VENUE_MODEL === 'D_HYBRID_V1' &&
+    settings.NO_VENUE_CODES.indexOf(code) !== -1
+  ) {
+    return [0, 0, 0, 0, 0, 0];
+  }
+
+  return venue.values.slice();
+}
+
+function validateStaticConfig_() {
+  if (!CONFIG.SPREADSHEET_ID || CONFIG.SPREADSHEET_ID.indexOf('ここに') >= 0) {
+    throw new Error('CONFIG.SPREADSHEET_IDを設定してください。');
+  }
+
+  if (!CONFIG.OUTPUT_SHEET) throw new Error('CONFIG.OUTPUT_SHEETが空です。');
+  if (!CONFIG.LOGIC_SETTINGS_SHEET) {
+    throw new Error('CONFIG.LOGIC_SETTINGS_SHEETが空です。');
+  }
+  if (!CONFIG.API_URL) throw new Error('CONFIG.API_URLが空です。');
+}
+
+function debugTodayApiStructure() {
+  const response = UrlFetchApp.fetch(CONFIG.API_URL, {
+    method: 'get',
+    muteHttpExceptions: true,
+    followRedirects: true,
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0 BoatRaceMC/1.0.0'
+    }
+  });
+
+  const status = response.getResponseCode();
+  const text = response.getContentText('UTF-8');
+
+  console.log('HTTPステータス: ' + status);
+  console.log('文字数: ' + text.length);
+  console.log('先頭1000文字:\n' + text.slice(0, 1000));
+
+  if (status < 200 || status >= 300) {
+    throw new Error('API取得失敗 HTTP ' + status);
+  }
+
+  const payload = JSON.parse(text);
+
+  console.log('トップレベルキー: ' + Object.keys(payload || {}).join(', '));
+
+  const races = normalizeTodayRaces_(payload);
+  console.log('抽出レース数: ' + races.length);
+
+  if (races.length) {
+    console.log('先頭レース:\n' + JSON.stringify(races[0], null, 2));
+  }
+}
+
+function fetchJson_(url) {
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    muteHttpExceptions: true,
+    followRedirects: true,
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0 BoatRaceMC/1.0.0'
+    }
+  });
+
+  const code = response.getResponseCode();
+
+  if (code < 200 || code >= 300) {
+    throw new Error(
+      'API取得失敗 HTTP ' +
+      code +
+      ': ' +
+      response.getContentText().slice(0, 300)
+    );
+  }
+
+  try {
+    return JSON.parse(response.getContentText());
+  } catch (err) {
+    throw new Error('APIレスポンスをJSONとして解析できません: ' + err.message);
+  }
+}
+
+function normalizeTodayRaces_(payload) {
+  const programs =
+    payload && Array.isArray(payload.programs)
+      ? payload.programs
+      : [];
+
+  const races = [];
+
+  programs.forEach(function(program) {
+    if (!program || !Array.isArray(program.boats)) return;
+    if (program.boats.length !== 6) return;
+
+    const venueCode = String(program.stadium_number).padStart(2, '0');
+    const venue = VENUE_ADJUST[venueCode];
+
+    if (!venue) {
+      console.log('Venue_master未登録の場コード: ' + venueCode);
+      return;
+    }
+
+    const raceNo = toInt_(program.number);
+    if (!raceNo) return;
+
+    const boats = program.boats
+      .map(function(boat) {
+        return normalizeBoat_(boat);
+      })
+      .sort(function(a, b) {
+        return a.lane - b.lane;
+      });
+
+    if (
+      boats.length !== 6 ||
+      boats.some(function(boat) {
+        return !boat.lane;
+      })
+    ) {
+      console.log(venue.name + raceNo + 'R: 艇データを正規化できません');
+      return;
+    }
+
+    races.push({
+      venueCode: venueCode,
+      venueName: venue.name,
+      raceNo: raceNo,
+      deadline: normalizeDeadline_(program.closed_at),
+      raceDate: normalizeDate_(program.date),
+      raceDateText: normalizeDateText_(program.date),
+      boats: boats,
+      dayLabel: program.day_label || '',
+      gradeLabel: program.grade_label || '',
+      gradeNumber: toInt_(program.grade_number),
+      title: program.title || '',
+      subtitle: program.subtitle || '',
+      distance: toInt_(program.distance)
+    });
+  });
+
+  return races.sort(function(a, b) {
+    if (a.venueCode !== b.venueCode) {
+      return a.venueCode.localeCompare(b.venueCode);
+    }
+    return a.raceNo - b.raceNo;
+  });
+}
+
+function normalizeBoat_(raw) {
+  raw = raw || {};
+
+  const classMap = {
+    1: 'A1',
+    2: 'A2',
+    3: 'B1',
+    4: 'B2'
+  };
+
+  return {
+    lane: toInt_(raw.racer_boat_number),
+    racerName: String(raw.racer_name || '').trim(),
+    racerNumber: normalizeRacerNumber_(raw.racer_number),
+    className: classMap[toInt_(raw.racer_class_number)] || 'B2',
+
+    nationalWinRate: toNumber_(raw.racer_national_top_1_percent),
+    localWinRate: toNumber_(raw.racer_local_top_1_percent),
+
+    national2Rate: normalizeRate_(raw.racer_national_top_2_percent),
+    national3Rate: normalizeRate_(raw.racer_national_top_3_percent),
+    local2Rate: normalizeRate_(raw.racer_local_top_2_percent),
+    local3Rate: normalizeRate_(raw.racer_local_top_3_percent),
+
+    avgSt: toNumber_(raw.racer_average_start_timing),
+
+    motor2Rate: normalizeRate_(raw.racer_assigned_motor_top_2_percent),
+    motor3Rate: normalizeRate_(raw.racer_assigned_motor_top_3_percent),
+
+    boat2Rate: normalizeRate_(raw.racer_assigned_boat_top_2_percent),
+    boat3Rate: normalizeRate_(raw.racer_assigned_boat_top_3_percent),
+
+    flyingCount: toInt_(raw.racer_flying_count),
+    lateCount: toInt_(raw.racer_late_count),
+
+    motorNumber: toInt_(raw.racer_assigned_motor_number),
+    boatNumber: toInt_(raw.racer_assigned_boat_number),
+
+    racerAge: toInt_(raw.racer_age),
+    racerWeight: toNumber_(raw.racer_weight),
+    branchNumber: toInt_(raw.racer_branch_number),
+    birthplaceNumber: toInt_(raw.racer_birthplace_number)
+  };
+}
+
+function validateBoatIdentities_(boats) {
+  const errors = [];
+
+  if (!Array.isArray(boats) || boats.length !== 6) {
+    return ['6艇分のデータがありません'];
+  }
+
+  boats.forEach(function(boat, index) {
+    const expectedLane = index + 1;
+
+    if (boat.lane !== expectedLane) {
+      errors.push(expectedLane + '号艇の艇番不一致=' + boat.lane);
+    }
+
+    if (!String(boat.racerName || '').trim()) {
+      errors.push(expectedLane + '号艇の選手名欠損');
+    }
+
+    if (!/^\d{4}$/.test(String(boat.racerNumber || ''))) {
+      errors.push(
+        expectedLane +
+        '号艇の登録番号不正=' +
+        String(boat.racerNumber || '空欄')
+      );
+    }
+  });
+
+  return errors;
+}
+
+function calculateBaseScore_(boat, course, venueCode, settings) {
+  const classPoint = CLASS_POINTS[boat.className] || 3;
+
+  const nationalWin =
+    isFiniteNumber_(boat.nationalWinRate) ? boat.nationalWinRate : 4.5;
+
+  const localWin =
+    isFiniteNumber_(boat.localWinRate) ? boat.localWinRate : nationalWin;
+
+  const twoRate =
+    isFiniteNumber_(boat.national2Rate) ? boat.national2Rate : 0.30;
+
+  const threeRate =
+    isFiniteNumber_(boat.national3Rate) ? boat.national3Rate : 0.48;
+
+  const local2Rate =
+    isFiniteNumber_(boat.local2Rate) ? boat.local2Rate : twoRate;
+
+  const local3Rate =
+    isFiniteNumber_(boat.local3Rate) ? boat.local3Rate : threeRate;
+
+  const avgSt =
+    isFiniteNumber_(boat.avgSt) && boat.avgSt > 0 ? boat.avgSt : 0.18;
+
+  const motor =
+    isFiniteNumber_(boat.motor2Rate) ? boat.motor2Rate : 0.33;
+
+  const motor3 =
+    isFiniteNumber_(boat.motor3Rate) ? boat.motor3Rate : 0.50;
+
+  const boatRate =
+    isFiniteNumber_(boat.boat2Rate) ? boat.boat2Rate : 0.33;
+
+  const boat3 =
+    isFiniteNumber_(boat.boat3Rate) ? boat.boat3Rate : 0.50;
+
+  const flyingCount =
+    isFiniteNumber_(boat.flyingCount) ? boat.flyingCount : 0;
+
+  let score = 0;
+
+  score += 30;
+  score += classPoint * 2.2;
+  score += nationalWin * 4.0;
+  score += localWin * 1.8;
+  score += twoRate * 16.0;
+  score += threeRate * 6.0;
+  score += local2Rate * 5.0;
+  score += local3Rate * 2.0;
+  score += clamp_((0.20 - avgSt) * 110, -5, 9);
+  score += (motor - 0.33) * 20.0;
+  score += (motor3 - 0.50) * 5.0;
+  score += (boatRate - 0.33) * 7.0;
+  score += (boat3 - 0.50) * 2.0;
+  score -= flyingCount * 2.5;
+
+  const courseBase = [20, 6, 2, 0, -5, -10][course - 1];
+  score += courseBase;
+
+  const venueValues = getVenueAdjustValues_(venueCode, settings);
+  score += venueValues[course - 1] * settings.VENUE_WEIGHT;
+
+  return score;
+}
+
+function runMonteCarlo_(baseScores, noiseTransform, trials, noiseSd) {
+  const finishCounts = Array.from({length: 6}, function() {
+    return [0, 0, 0];
+  });
+
+  const exacta = {};
+  const quinella = {};
+  const trio = {};
+
+  for (let t = 0; t < trials; t++) {
+    const z = Array.from({length: 6}, randn_);
+    const corr = multiplyLowerTriangular_(noiseTransform, z);
+
+    const ranking = baseScores
+      .map(function(base, i) {
+        return {
+          lane: i + 1,
+          value: base + corr[i] * noiseSd
+        };
+      })
+      .sort(function(a, b) {
+        return b.value - a.value;
+      });
+
+    for (let p = 0; p < 3; p++) {
+      finishCounts[ranking[p].lane - 1][p]++;
+    }
+
+    const first = ranking[0].lane;
+    const second = ranking[1].lane;
+    const third = ranking[2].lane;
+
+    increment_(exacta, first + '→' + second);
+
+    increment_(
+      quinella,
+      [first, second].sort(function(a, b) {
+        return a - b;
+      }).join('=')
+    );
+
+    increment_(
+      trio,
+      [first, second, third].sort(function(a, b) {
+        return a - b;
+      }).join('=')
+    );
+  }
+
+  return {
+    finishCounts: finishCounts,
+    exacta: exacta,
+    quinella: quinella,
+    trio: trio,
+    trials: trials
+  };
+}
+
+function summarizeResult_(result) {
+  const trials = result.trials;
+
+  const p1 = result.finishCounts.map(function(x) {
+    return x[0] / trials;
+  });
+
+  const p2 = result.finishCounts.map(function(x) {
+    return x[1] / trials;
+  });
+
+  const p3 = result.finishCounts.map(function(x) {
+    return x[2] / trials;
+  });
+
+  const bestExacta = maxEntry_(result.exacta, trials);
+  const bestQuinella = maxEntry_(result.quinella, trials);
+  const bestTrio = maxEntry_(result.trio, trials);
+
+  const inWin = p1[0];
+  const inLose = 1 - inWin;
+
+  const sorted = p1.slice().sort(function(a, b) {
+    return b - a;
+  });
+
+  const entropy =
+    -p1.reduce(function(sum, p) {
+      return p > 0 ? sum + p * Math.log(p) : sum;
+    }, 0) / Math.log(6);
+
+  const gap = sorted[0] - sorted[1];
+
+  const confidence = clamp_(
+    (1 - entropy) * 0.55 +
+    gap * 0.90 +
+    sorted[0] * 0.25,
+    0,
+    1
+  );
+
+  let type = '中立';
+
+  if (inWin >= 0.58 && gap >= 0.12) {
+    type = 'ガチ';
+  } else if (inWin <= 0.43 && Math.max.apply(null, p1.slice(1)) >= 0.20) {
+    type = '穴';
+  }
+
+  const selected =
+    (type === 'ガチ' && inWin >= 0.62) ||
+    (type === '穴' && inWin <= 0.40 && confidence >= 0.30);
+
+  return {
+    p1: p1,
+    p2: p2,
+    p3: p3,
+    bestExacta: bestExacta,
+    bestQuinella: bestQuinella,
+    bestTrio: bestTrio,
+    inWin: inWin,
+    inLose: inLose,
+    confidence: confidence,
+    screeningType: type,
+    selected: selected
+  };
+}
+
+function buildOutputRow_(
+  race,
+  probabilityId,
+  now,
+  summary,
+  baseScores,
+  settings
+) {
+  const raceId =
+    Utilities.formatDate(race.raceDate, CONFIG.TIMEZONE, 'yyyyMMdd') +
+    '_' +
+    race.venueName +
+    race.raceNo +
+    'R';
+
+  const memo =
+    '朝モデル。Logic_Settings読込済み。' +
+    '展示未反映・オッズ取得なし。base=' +
+    baseScores.map(function(value) {
+      return value.toFixed(1);
+    }).join('/');
+
+  const racerIdentityValues = [];
+
+  race.boats.forEach(function(boat) {
+    racerIdentityValues.push(
+      String(boat.racerName || '').trim(),
+      String(boat.racerNumber || '').trim()
+    );
+  });
+
+  return [
+    probabilityId,
+    raceId,
+    race.raceDate,
+    String(race.venueCode),
+    race.venueName,
+    race.raceNo,
+    race.deadline,
+    CONFIG.PHASE,
+    now,
+    settings.MC_TRIALS,
+    settings.MODEL_VERSION,
+    settings.VENUE_WEIGHT,
+    settings.CORRELATION_MODE
+  ].concat(
+    summary.p1,
+    summary.p2,
+    summary.p3,
+    [
+      summary.bestExacta.key,
+      summary.bestExacta.prob,
+      summary.bestQuinella.key,
+      summary.bestQuinella.prob,
+      summary.bestTrio.key,
+      summary.bestTrio.prob,
+      summary.inWin,
+      summary.inLose,
+      summary.confidence,
+      summary.screeningType,
+      summary.selected,
+      memo
+    ],
+    racerIdentityValues
+  );
+}
+
+function buildProbabilityId_(race, settings) {
+  const dateText = Utilities.formatDate(
+    race.raceDate,
+    CONFIG.TIMEZONE,
+    'yyyyMMdd'
+  );
+
+  return (
+    dateText +
+    '_' +
+    race.venueName +
+    race.raceNo +
+    'R_' +
+    CONFIG.PHASE +
+    '_' +
+    settings.MODEL_VERSION
+  );
+}
+
+function validateApiRaceDate_(races) {
+  if (!CONFIG.REQUIRE_API_DATE_IS_TODAY) return;
+
+  const today = Utilities.formatDate(
+    new Date(),
+    CONFIG.TIMEZONE,
+    'yyyy-MM-dd'
+  );
+
+  const dates = Array.from(
+    new Set(
+      races.map(function(race) {
+        return Utilities.formatDate(
+          race.raceDate,
+          CONFIG.TIMEZONE,
+          'yyyy-MM-dd'
+        );
+      })
+    )
+  );
+
+  if (dates.length !== 1 || dates[0] !== today) {
+    throw new Error(
+      'APIレース日がJSTの本日と一致しません。' +
+      'JST本日=' +
+      today +
+      ' / API=' +
+      dates.join(',') +
+      '。前日データの誤登録を防ぐため中止しました。'
+    );
+  }
+}
+
+function findLastProbabilityDataRow_(sheet) {
+  const physicalLastRow = sheet.getLastRow();
+
+  if (physicalLastRow < 2) return 1;
+
+  const values = sheet
+    .getRange(2, 1, physicalLastRow - 1, 1)
+    .getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim() !== '') {
+      return i + 2;
+    }
+  }
+
+  return 1;
+}
+
+function setupOutputSheetFormat_(sheet) {
+  const lastFormatRow = Math.max(sheet.getMaxRows(), 2);
+
+  [
+    'A','B','D','E','G','H','K','M','AF','AH','AJ','AO','AQ'
+  ].forEach(function(column) {
+    sheet
+      .getRange(column + '2:' + column + lastFormatRow)
+      .setNumberFormat('@');
+  });
+
+  sheet.getRange('C2:C' + lastFormatRow).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange('I2:I' + lastFormatRow).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  sheet.getRange('F2:F' + lastFormatRow).setNumberFormat('0');
+  sheet.getRange('J2:J' + lastFormatRow).setNumberFormat('#,##0');
+  sheet.getRange('L2:L' + lastFormatRow).setNumberFormat('0.00');
+  sheet.getRange('N2:AE' + lastFormatRow).setNumberFormat('0.0%');
+  sheet.getRange('AG2:AG' + lastFormatRow).setNumberFormat('0.0%');
+  sheet.getRange('AI2:AI' + lastFormatRow).setNumberFormat('0.0%');
+  sheet.getRange('AK2:AK' + lastFormatRow).setNumberFormat('0.0%');
+  sheet.getRange('AL2:AN' + lastFormatRow).setNumberFormat('0.0%');
+  sheet.getRange('AP2:AP' + lastFormatRow).setNumberFormat('General');
+
+  // 選手名・登録番号は文字列
+  sheet.getRange('AR2:BC' + lastFormatRow).setNumberFormat('@');
+}
+
+function repairOutputSheetFormat() {
+  validateStaticConfig_();
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+
+  if (!sheet) {
+    throw new Error('出力シートがありません: ' + CONFIG.OUTPUT_SHEET);
+  }
+
+  verifyHeaders_(sheet);
+  setupOutputSheetFormat_(sheet);
+  SpreadsheetApp.flush();
+
+  console.log('GAS_Probability_Logの書式を修復しました。');
+}
+
+function readExistingIds_(sheet) {
+  const idSet = new Set();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return idSet;
+
+  sheet
+    .getRange(2, 1, lastRow - 1, 1)
+    .getDisplayValues()
+    .forEach(function(row) {
+      if (row[0]) idSet.add(row[0]);
+    });
+
+  return idSet;
+}
+
+function verifyHeaders_(sheet) {
+  const actual = sheet
+    .getRange(1, 1, 1, OUTPUT_HEADERS.length)
+    .getDisplayValues()[0];
+
+  const mismatches = [];
+
+  OUTPUT_HEADERS.forEach(function(header, index) {
+    if (actual[index] !== header) {
+      mismatches.push((index + 1) + ':' + actual[index] + '→' + header);
+    }
+  });
+
+  if (mismatches.length) {
+    throw new Error(
+      'GAS_Probability_Logのヘッダー不一致: ' +
+      mismatches.slice(0, 12).join(', ')
+    );
+  }
+}
+
+function buildNoiseTransform_(correlationMode) {
+  if (correlationMode === 'none') {
+    return identityMatrix_(6);
+  }
+
+  if (correlationMode === 'fixed_cholesky_v1') {
+    return choleskyDecomposition_(CORR_MATRIX);
+  }
+
+  throw new Error('未対応のCORRELATION_MODEです: ' + correlationMode);
+}
+
+function identityMatrix_(size) {
+  return Array.from({length: size}, function(_, row) {
+    return Array.from({length: size}, function(__, column) {
+      return row === column ? 1 : 0;
+    });
+  });
+}
+
+function choleskyDecomposition_(matrix) {
+  const size = matrix.length;
+
+  const lower = Array.from({length: size}, function() {
+    return Array(size).fill(0);
+  });
+
+  for (let i = 0; i < size; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = 0;
+
+      for (let k = 0; k < j; k++) {
+        sum += lower[i][k] * lower[j][k];
+      }
+
+      if (i === j) {
+        const value = matrix[i][i] - sum;
+
+        if (value <= 1e-12) {
+          throw new Error(
+            '相関行列が正定値ではありません。index=' +
+            i +
+            ', value=' +
+            value
+          );
+        }
+
+        lower[i][j] = Math.sqrt(value);
+      } else {
+        lower[i][j] = (matrix[i][j] - sum) / lower[j][j];
+      }
+    }
+  }
+
+  return lower;
+}
+
+function multiplyLowerTriangular_(lower, vector) {
+  return lower.map(function(row, i) {
+    let sum = 0;
+
+    for (let j = 0; j <= i; j++) {
+      sum += row[j] * vector[j];
+    }
+
+    return sum;
+  });
+}
+
+function randn_() {
+  let u = 0;
+  let v = 0;
+
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+
+  return (
+    Math.sqrt(-2.0 * Math.log(u)) *
+    Math.cos(2.0 * Math.PI * v)
+  );
+}
+
+function maxEntry_(object, denominator) {
+  let bestKey = '';
+  let bestValue = -1;
+
+  Object.keys(object).forEach(function(key) {
+    if (object[key] > bestValue) {
+      bestValue = object[key];
+      bestKey = key;
+    }
+  });
+
+  return {
+    key: bestKey,
+    prob: bestValue < 0 ? 0 : bestValue / denominator
+  };
+}
+
+function increment_(object, key) {
+  object[key] = (object[key] || 0) + 1;
+}
+
+function firstDefined_(object, keys) {
+  for (let i = 0; i < keys.length; i++) {
+    if (
+      object &&
+      Object.prototype.hasOwnProperty.call(object, keys[i]) &&
+      object[keys[i]] !== null &&
+      object[keys[i]] !== ''
+    ) {
+      return object[keys[i]];
+    }
+  }
+
+  return null;
+}
+
+function normalizeVenueCode_(raw, name) {
+  if (raw !== null && raw !== undefined && raw !== '') {
+    const digits = String(raw).replace(/\D/g, '');
+
+    if (digits) {
+      const code = ('0' + parseInt(digits, 10)).slice(-2);
+
+      if (VENUE_ADJUST[code]) {
+        return code;
+      }
+    }
+  }
+
+  return VENUE_NAME_TO_CODE[String(name || '').trim()] || '';
+}
+
+function normalizeRate_(value) {
+  const number = toNumber_(value);
+
+  if (!isFiniteNumber_(number)) return NaN;
+
+  return number > 1.5 ? number / 100 : number;
+}
+
+function normalizeRacerNumber_(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  return String(value).replace(/\D/g, '').trim();
+}
+
+function toNumber_(value) {
+  if (value === null || value === undefined || value === '') {
+    return NaN;
+  }
+
+  const number = Number(
+    String(value)
+      .replace('%', '')
+      .replace(',', '.')
+      .trim()
+  );
+
+  return Number.isFinite(number) ? number : NaN;
+}
+
+function toInt_(value) {
+  const number = parseInt(value, 10);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function isFiniteNumber_(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function clamp_(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeDate_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return value;
+  }
+
+  const text = String(value || '').trim();
+
+  const match = text.match(
+    /(\d{4})[-\/]?(\d{1,2})[-\/]?(\d{1,2})/
+  );
+
+  if (match) {
+    return new Date(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3])
+    );
+  }
+
+  const now = new Date();
+
+  return new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate()
+  );
+}
+
+function normalizeDateText_(value) {
+  const date = normalizeDate_(value);
+
+  return Utilities.formatDate(
+    date,
+    CONFIG.TIMEZONE,
+    'yyyy-MM-dd'
+  );
+}
+
+function normalizeDeadline_(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(
+      value,
+      CONFIG.TIMEZONE,
+      'HH:mm'
+    );
+  }
+
+  const text = String(value).trim();
+  const match = text.match(/(\d{1,2}):(\d{2})/);
+
+  return match
+    ? ('0' + match[1]).slice(-2) + ':' + match[2]
+    : text;
+}
+
+function columnNumberToLetter_(columnNumber) {
+  let number = columnNumber;
+  let result = '';
+
+  while (number > 0) {
+    const remainder = (number - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    number = Math.floor((number - 1) / 26);
+  }
+
+  return result;
+}
+
+function clearProbabilityLogData() {
+  validateStaticConfig_();
+
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+
+  if (!sheet) {
+    throw new Error('出力シートがありません: ' + CONFIG.OUTPUT_SHEET);
+  }
+
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow >= 2) {
+    sheet
+      .getRange(
+        2,
+        1,
+        lastRow - 1,
+        OUTPUT_HEADERS.length
+      )
+      .clearContent();
+  }
+
+  SpreadsheetApp.flush();
+
+  console.log(
+    'GAS_Probability_Logのデータ行を消去しました。' +
+    'ヘッダーと書式は残しています。'
+  );
+}
+
+function describeStructure_(node, depth, maxDepth) {
+  if (depth > maxDepth) return '…';
+  if (node === null) return null;
+
+  if (Array.isArray(node)) {
+    return {
+      type: 'array',
+      length: node.length,
+      sample:
+        node.length
+          ? describeStructure_(node[0], depth + 1, maxDepth)
+          : null
+    };
+  }
+
+  if (typeof node !== 'object') return typeof node;
+
+  const output = {};
+
+  Object.keys(node)
+    .slice(0, 30)
+    .forEach(function(key) {
+      output[key] = describeStructure_(
+        node[key],
+        depth + 1,
+        maxDepth
+      );
+    });
+
+  return output;
+}
+

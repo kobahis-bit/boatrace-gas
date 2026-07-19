@@ -1,1 +1,1447 @@
+/**
+ * BoatRace Backtest Audit & Venue Statistics v1.0.0
+ * 過学習対策版（5月=開発、6月=検証）
+ * ------------------------------------------------------------
+ * 対象Spreadsheet:
+ *   1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0
+ *
+ * 使用する既存シート:
+ *   - Backtest_Race
+ *   - Backtest_Racer
+ *   - Validation_Summary（監査結果を追記）
+ *   - Parameter_Test（会場×コース実績を追記）
+ *
+ * 新しいシートは作成しません。
+ *
+ * 主な実行関数:
+ *   btaRunAuditAndVenueStats()
+ *
+ * 出力:
+ *   Validation_Summary:
+ *     データ監査結果
+ *
+ *   Parameter_Test:
+ *     5月（開発）
+ *     6月（未見検証）
+ *     5〜6月（参考）
+ *     の会場×コース成績
+ */
+
+const BTA_CONFIG = Object.freeze({
+  SPREADSHEET_ID: '1AgNQ0vj5G8_Qjz_PNdUWUqsE8kRKIYcfVXFOl9ho6n0',
+
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+  VALIDATION_SHEET: 'Validation_Summary',
+  PARAMETER_SHEET: 'Parameter_Test',
+
+  TIMEZONE: 'Asia/Tokyo',
+
+  START_DATE: '2026-05-01',
+  END_DATE: '2026-06-30',
+
+  DEVELOPMENT_START: '2026-05-01',
+  DEVELOPMENT_END: '2026-05-31',
+
+  VALIDATION_START: '2026-06-01',
+  VALIDATION_END: '2026-06-30',
+
+  MIN_VENUE_RACES: 100,
+  MIN_VENUE_COURSE_STARTS: 30
+});
+
+const BTA_TECHNIQUE_NAMES = Object.freeze({
+  1: '逃げ',
+  2: '差し',
+  3: 'まくり',
+  4: 'まくり差し',
+  5: '抜き',
+  6: '恵まれ'
+});
+
+/**
+ * データ監査と会場×コース集計を一括実行する。
+ */
+function btaRunAuditAndVenueStats() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.openById(
+      BTA_CONFIG.SPREADSHEET_ID
+    );
+
+    const raceSheet = btaRequireSheet_(
+      ss,
+      BTA_CONFIG.RACE_SHEET
+    );
+    const racerSheet = btaRequireSheet_(
+      ss,
+      BTA_CONFIG.RACER_SHEET
+    );
+    const validationSheet = btaRequireSheet_(
+      ss,
+      BTA_CONFIG.VALIDATION_SHEET
+    );
+    const parameterSheet = btaRequireSheet_(
+      ss,
+      BTA_CONFIG.PARAMETER_SHEET
+    );
+
+    const raceValues = raceSheet
+      .getDataRange()
+      .getValues();
+
+    const racerValues = racerSheet
+      .getDataRange()
+      .getValues();
+
+    if (raceValues.length < 2) {
+      throw new Error('Backtest_Raceにデータがありません。');
+    }
+
+    if (racerValues.length < 2) {
+      throw new Error('Backtest_Racerにデータがありません。');
+    }
+
+    const raceHeader = btaBuildHeaderMap_(
+      raceValues[0],
+      [
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        'R',
+        'Result有',
+        '決まり手番号',
+        '1着艇',
+        '2着艇',
+        '3着艇',
+        '2連単組合せ',
+        '2連単払戻',
+        '2連複組合せ',
+        '2連複払戻',
+        '3連単組合せ',
+        '3連単払戻',
+        '3連複組合せ',
+        '3連複払戻'
+      ],
+      BTA_CONFIG.RACE_SHEET
+    );
+
+    const racerHeader = btaBuildHeaderMap_(
+      racerValues[0],
+      [
+        'Racer_Row_ID',
+        'Race_ID',
+        '日付',
+        '場コード',
+        '場',
+        'R',
+        '艇番',
+        '選手名',
+        '選手番号',
+        '平均ST',
+        'モーター番号',
+        'モーター2連率',
+        '展示有',
+        '展示コース',
+        '展示ST',
+        '結果有',
+        '本番コース',
+        '本番ST',
+        '着順'
+      ],
+      BTA_CONFIG.RACER_SHEET
+    );
+
+    const normalizedRaceRows = btaNormalizeRaceRows_(
+      raceValues.slice(1),
+      raceHeader
+    );
+
+    const normalizedRacerRows = btaNormalizeRacerRows_(
+      racerValues.slice(1),
+      racerHeader
+    );
+
+    const audit = btaAuditData_(
+      normalizedRaceRows,
+      normalizedRacerRows
+    );
+
+    const statsRows = []
+      .concat(
+        btaBuildVenueCourseStats_(
+          normalizedRaceRows,
+          normalizedRacerRows,
+          BTA_CONFIG.DEVELOPMENT_START,
+          BTA_CONFIG.DEVELOPMENT_END,
+          'DEVELOPMENT_2026-05'
+        )
+      )
+      .concat(
+        btaBuildVenueCourseStats_(
+          normalizedRaceRows,
+          normalizedRacerRows,
+          BTA_CONFIG.VALIDATION_START,
+          BTA_CONFIG.VALIDATION_END,
+          'VALIDATION_2026-06'
+        )
+      )
+      .concat(
+        btaBuildVenueCourseStats_(
+          normalizedRaceRows,
+          normalizedRacerRows,
+          BTA_CONFIG.START_DATE,
+          BTA_CONFIG.END_DATE,
+          'REFERENCE_2026-05_06'
+        )
+      );
+
+    const runId = Utilities.formatDate(
+      new Date(),
+      BTA_CONFIG.TIMEZONE,
+      'yyyyMMdd_HHmmss'
+    );
+
+    btaAppendAuditReport_(
+      validationSheet,
+      runId,
+      audit
+    );
+
+    btaAppendVenueStats_(
+      parameterSheet,
+      runId,
+      statsRows
+    );
+
+    SpreadsheetApp.flush();
+
+    const result = {
+      status: 'COMPLETED',
+      runId: runId,
+      raceRowsInPeriod: audit.raceCount,
+      racerRowsInPeriod: audit.racerCount,
+      auditErrors: audit.errorCount,
+      auditWarnings: audit.warningCount,
+      venueStatsRows: statsRows.length,
+      nextStep:
+        audit.errorCount === 0
+          ? '5月データで会場補正候補を作成可能'
+          : '監査エラーを修正してから会場補正へ進む'
+    };
+
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Backtest_Raceを分析用オブジェクトへ変換。
+ */
+function btaNormalizeRaceRows_(rows, h) {
+  const output = [];
+
+  rows.forEach(function(row, index) {
+    const raceId = String(
+      row[h.Race_ID] || ''
+    ).trim();
+
+    if (!raceId) {
+      return;
+    }
+
+    const dateText = btaDateText_(
+      row[h['日付']]
+    );
+
+    if (
+      dateText < BTA_CONFIG.START_DATE ||
+      dateText > BTA_CONFIG.END_DATE
+    ) {
+      return;
+    }
+
+    output.push({
+      sheetRow: index + 2,
+      raceId: raceId,
+      date: dateText,
+      venueCode: btaPad2_(
+        row[h['場コード']]
+      ),
+      venue: String(
+        row[h['場']] || ''
+      ).trim(),
+      raceNo: btaIntOrNull_(
+        row[h.R]
+      ),
+      resultExists: btaBoolean_(
+        row[h['Result有']]
+      ),
+      technique: btaIntOrNull_(
+        row[h['決まり手番号']]
+      ),
+      first: btaIntOrNull_(
+        row[h['1着艇']]
+      ),
+      second: btaIntOrNull_(
+        row[h['2着艇']]
+      ),
+      third: btaIntOrNull_(
+        row[h['3着艇']]
+      ),
+      exactaCombination:
+        btaCombinationText_(
+          row[h['2連単組合せ']]
+        ),
+      exactaPayout: btaNumberOrNull_(
+        row[h['2連単払戻']]
+      ),
+      quinellaCombination:
+        btaCombinationText_(
+          row[h['2連複組合せ']]
+        ),
+      quinellaPayout: btaNumberOrNull_(
+        row[h['2連複払戻']]
+      ),
+      trifectaCombination:
+        btaCombinationText_(
+          row[h['3連単組合せ']]
+        ),
+      trifectaPayout: btaNumberOrNull_(
+        row[h['3連単払戻']]
+      ),
+      trioCombination:
+        btaCombinationText_(
+          row[h['3連複組合せ']]
+        ),
+      trioPayout: btaNumberOrNull_(
+        row[h['3連複払戻']]
+      )
+    });
+  });
+
+  return output;
+}
+
+/**
+ * Backtest_Racerを分析用オブジェクトへ変換。
+ */
+function btaNormalizeRacerRows_(rows, h) {
+  const output = [];
+
+  rows.forEach(function(row, index) {
+    const racerRowId = String(
+      row[h.Racer_Row_ID] || ''
+    ).trim();
+
+    const raceId = String(
+      row[h.Race_ID] || ''
+    ).trim();
+
+    if (!racerRowId || !raceId) {
+      return;
+    }
+
+    const dateText = btaDateText_(
+      row[h['日付']]
+    );
+
+    if (
+      dateText < BTA_CONFIG.START_DATE ||
+      dateText > BTA_CONFIG.END_DATE
+    ) {
+      return;
+    }
+
+    output.push({
+      sheetRow: index + 2,
+      racerRowId: racerRowId,
+      raceId: raceId,
+      date: dateText,
+      venueCode: btaPad2_(
+        row[h['場コード']]
+      ),
+      venue: String(
+        row[h['場']] || ''
+      ).trim(),
+      raceNo: btaIntOrNull_(
+        row[h.R]
+      ),
+      lane: btaIntOrNull_(
+        row[h['艇番']]
+      ),
+      racerName: String(
+        row[h['選手名']] || ''
+      ).trim(),
+      racerNumber:
+        btaRacerNumberText_(
+          row[h['選手番号']]
+        ),
+      averageSt: btaNumberOrNull_(
+        row[h['平均ST']]
+      ),
+      motorNumber: btaIntOrNull_(
+        row[h['モーター番号']]
+      ),
+      motor2Rate: btaNormalizeRateOrNull_(
+        row[h['モーター2連率']]
+      ),
+      previewExists: btaBoolean_(
+        row[h['展示有']]
+      ),
+      previewCourse: btaIntOrNull_(
+        row[h['展示コース']]
+      ),
+      previewSt: btaNumberOrNull_(
+        row[h['展示ST']]
+      ),
+      resultExists: btaBoolean_(
+        row[h['結果有']]
+      ),
+      resultCourse: btaIntOrNull_(
+        row[h['本番コース']]
+      ),
+      resultSt: btaNumberOrNull_(
+        row[h['本番ST']]
+      ),
+      finish: btaIntOrNull_(
+        row[h['着順']]
+      )
+    });
+  });
+
+  return output;
+}
+
+/**
+ * データ監査。
+ */
+function btaAuditData_(raceRows, racerRows) {
+  const details = [];
+
+  const raceIdCounts = btaCountBy_(
+    raceRows,
+    function(row) {
+      return row.raceId;
+    }
+  );
+
+  const duplicateRaceIds = Object.keys(
+    raceIdCounts
+  ).filter(function(key) {
+    return raceIdCounts[key] > 1;
+  });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    'Race_ID重複',
+    duplicateRaceIds.length,
+    duplicateRaceIds.slice(0, 20).join(', ')
+  );
+
+  const racerIdCounts = btaCountBy_(
+    racerRows,
+    function(row) {
+      return row.racerRowId;
+    }
+  );
+
+  const duplicateRacerIds = Object.keys(
+    racerIdCounts
+  ).filter(function(key) {
+    return racerIdCounts[key] > 1;
+  });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    'Racer_Row_ID重複',
+    duplicateRacerIds.length,
+    duplicateRacerIds.slice(0, 20).join(', ')
+  );
+
+  const racersByRace = {};
+
+  racerRows.forEach(function(row) {
+    if (!racersByRace[row.raceId]) {
+      racersByRace[row.raceId] = [];
+    }
+
+    racersByRace[row.raceId].push(row);
+  });
+
+  const invalidSixBoatRaces = [];
+
+  raceRows.forEach(function(race) {
+    const racers =
+      racersByRace[race.raceId] || [];
+
+    const uniqueLanes = new Set(
+      racers.map(function(x) {
+        return x.lane;
+      })
+    );
+
+    const validLaneSet =
+      racers.length === 6 &&
+      uniqueLanes.size === 6 &&
+      [1, 2, 3, 4, 5, 6].every(function(lane) {
+        return uniqueLanes.has(lane);
+      });
+
+    if (!validLaneSet) {
+      invalidSixBoatRaces.push(
+        race.raceId +
+        '（行数=' +
+        racers.length +
+        '）'
+      );
+    }
+  });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '1レース6艇不成立',
+    invalidSixBoatRaces.length,
+    invalidSixBoatRaces
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingResultRaces = raceRows
+    .filter(function(row) {
+      return !row.resultExists;
+    })
+    .map(function(row) {
+      return row.raceId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    'Result欠損',
+    missingResultRaces.length,
+    missingResultRaces
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingTechniqueRaces = raceRows
+    .filter(function(row) {
+      return (
+        row.resultExists &&
+        !row.technique
+      );
+    })
+    .map(function(row) {
+      return row.raceId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'WARNING',
+    '決まり手欠損',
+    missingTechniqueRaces.length,
+    missingTechniqueRaces
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingFinishRaces = raceRows
+    .filter(function(row) {
+      return (
+        row.resultExists &&
+        (
+          !row.first ||
+          !row.second ||
+          !row.third
+        )
+      );
+    })
+    .map(function(row) {
+      return row.raceId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '1〜3着欠損',
+    missingFinishRaces.length,
+    missingFinishRaces
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const invalidTrifecta = raceRows
+    .filter(function(row) {
+      return (
+        row.resultExists &&
+        !/^[1-6]-[1-6]-[1-6]$/.test(
+          row.trifectaCombination
+        )
+      );
+    })
+    .map(function(row) {
+      return (
+        row.raceId +
+        '=' +
+        row.trifectaCombination
+      );
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '3連単組合せ異常',
+    invalidTrifecta.length,
+    invalidTrifecta
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingTrifectaPayout = raceRows
+    .filter(function(row) {
+      return (
+        row.resultExists &&
+        (
+          row.trifectaPayout === null ||
+          row.trifectaPayout <= 0
+        )
+      );
+    })
+    .map(function(row) {
+      return row.raceId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '3連単払戻欠損',
+    missingTrifectaPayout.length,
+    missingTrifectaPayout
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingRacerNumber = racerRows
+    .filter(function(row) {
+      return !/^\d{4}$/.test(
+        row.racerNumber
+      );
+    })
+    .map(function(row) {
+      return row.racerRowId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '選手番号欠損・不正',
+    missingRacerNumber.length,
+    missingRacerNumber
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingRacerName = racerRows
+    .filter(function(row) {
+      return !row.racerName;
+    })
+    .map(function(row) {
+      return row.racerRowId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '選手名欠損',
+    missingRacerName.length,
+    missingRacerName
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingAverageSt = racerRows
+    .filter(function(row) {
+      return (
+        row.averageSt === null ||
+        row.averageSt <= 0 ||
+        row.averageSt > 1
+      );
+    })
+    .map(function(row) {
+      return row.racerRowId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'WARNING',
+    '平均ST欠損・異常',
+    missingAverageSt.length,
+    missingAverageSt
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingMotor = racerRows
+    .filter(function(row) {
+      return (
+        row.motorNumber === null ||
+        row.motorNumber <= 0 ||
+        row.motor2Rate === null
+      );
+    })
+    .map(function(row) {
+      return row.racerRowId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'WARNING',
+    'モーターデータ欠損',
+    missingMotor.length,
+    missingMotor
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const missingResultRacer = racerRows
+    .filter(function(row) {
+      return (
+        !row.resultExists ||
+        row.resultCourse === null ||
+        row.finish === null
+      );
+    })
+    .map(function(row) {
+      return row.racerRowId;
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '艇別結果欠損',
+    missingResultRacer.length,
+    missingResultRacer
+      .slice(0, 20)
+      .join(', ')
+  );
+
+  const expectedDates = btaDateList_(
+    BTA_CONFIG.START_DATE,
+    BTA_CONFIG.END_DATE
+  );
+
+  const actualDates = new Set(
+    raceRows.map(function(row) {
+      return row.date;
+    })
+  );
+
+  const missingDates = expectedDates
+    .filter(function(date) {
+      return !actualDates.has(date);
+    });
+
+  btaAddAuditDetail_(
+    details,
+    'ERROR',
+    '日付欠落',
+    missingDates.length,
+    missingDates.join(', ')
+  );
+
+  const errorCount = details
+    .filter(function(row) {
+      return (
+        row.level === 'ERROR' &&
+        row.count > 0
+      );
+    }).length;
+
+  const warningCount = details
+    .filter(function(row) {
+      return (
+        row.level === 'WARNING' &&
+        row.count > 0
+      );
+    }).length;
+
+  return {
+    raceCount: raceRows.length,
+    racerCount: racerRows.length,
+    errorCount: errorCount,
+    warningCount: warningCount,
+    details: details
+  };
+}
+
+/**
+ * 会場×コースの実績を作る。
+ * 本番コースを基準にする。
+ */
+function btaBuildVenueCourseStats_(
+  raceRows,
+  racerRows,
+  startDate,
+  endDate,
+  periodLabel
+) {
+  const raceMap = {};
+
+  raceRows.forEach(function(race) {
+    if (
+      race.date >= startDate &&
+      race.date <= endDate
+    ) {
+      raceMap[race.raceId] = race;
+    }
+  });
+
+  const aggregates = {};
+
+  racerRows.forEach(function(racer) {
+    const race = raceMap[racer.raceId];
+
+    if (!race) {
+      return;
+    }
+
+    const course = racer.resultCourse;
+
+    if (
+      course === null ||
+      course < 1 ||
+      course > 6 ||
+      racer.finish === null
+    ) {
+      return;
+    }
+
+    const key =
+      racer.venueCode +
+      '_' +
+      course;
+
+    if (!aggregates[key]) {
+      aggregates[key] = {
+        period: periodLabel,
+        startDate: startDate,
+        endDate: endDate,
+        venueCode: racer.venueCode,
+        venue: racer.venue,
+        course: course,
+        starts: 0,
+        wins: 0,
+        seconds: 0,
+        thirds: 0,
+        techniqueCounts: {
+          1: 0,
+          2: 0,
+          3: 0,
+          4: 0,
+          5: 0,
+          6: 0
+        }
+      };
+    }
+
+    const a = aggregates[key];
+
+    a.starts++;
+
+    if (racer.finish === 1) {
+      a.wins++;
+
+      if (race.technique) {
+        a.techniqueCounts[
+          race.technique
+        ] =
+          (
+            a.techniqueCounts[
+              race.technique
+            ] || 0
+          ) + 1;
+      }
+    }
+
+    if (racer.finish === 2) {
+      a.seconds++;
+    }
+
+    if (racer.finish === 3) {
+      a.thirds++;
+    }
+  });
+
+  return Object.keys(aggregates)
+    .sort(function(a, b) {
+      const x = aggregates[a];
+      const y = aggregates[b];
+
+      if (x.venueCode !== y.venueCode) {
+        return x.venueCode.localeCompare(
+          y.venueCode
+        );
+      }
+
+      return x.course - y.course;
+    })
+    .map(function(key) {
+      const a = aggregates[key];
+
+      return {
+        period: a.period,
+        startDate: a.startDate,
+        endDate: a.endDate,
+        venueCode: a.venueCode,
+        venue: a.venue,
+        course: a.course,
+        starts: a.starts,
+        wins: a.wins,
+        winRate: btaSafeRate_(
+          a.wins,
+          a.starts
+        ),
+        secondRate: btaSafeRate_(
+          a.seconds,
+          a.starts
+        ),
+        thirdRate: btaSafeRate_(
+          a.thirds,
+          a.starts
+        ),
+        top2Rate: btaSafeRate_(
+          a.wins + a.seconds,
+          a.starts
+        ),
+        top3Rate: btaSafeRate_(
+          (
+            a.wins +
+            a.seconds +
+            a.thirds
+          ),
+          a.starts
+        ),
+        escapeWins:
+          a.techniqueCounts[1] || 0,
+        differenceWins:
+          a.techniqueCounts[2] || 0,
+        makuriWins:
+          a.techniqueCounts[3] || 0,
+        makuriSashiWins:
+          a.techniqueCounts[4] || 0,
+        nukiWins:
+          a.techniqueCounts[5] || 0,
+        megumareWins:
+          a.techniqueCounts[6] || 0,
+        sampleStatus:
+          a.starts >=
+          BTA_CONFIG.MIN_VENUE_COURSE_STARTS
+            ? 'ENOUGH'
+            : 'SMALL_SAMPLE'
+      };
+    });
+}
+
+/**
+ * Validation_Summaryへ監査結果を追記。
+ */
+function btaAppendAuditReport_(
+  sheet,
+  runId,
+  audit
+) {
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    '実行日時',
+    '期間開始',
+    '期間終了',
+    'Level',
+    'Check_Name',
+    'Count',
+    'Sample',
+    'Race_Count',
+    'Racer_Count',
+    '総合判定'
+  ];
+
+  const now = new Date();
+
+  const rows = audit.details.map(function(x) {
+    return [
+      runId,
+      'DATA_AUDIT',
+      now,
+      BTA_CONFIG.START_DATE,
+      BTA_CONFIG.END_DATE,
+      x.level,
+      x.name,
+      x.count,
+      x.sample,
+      audit.raceCount,
+      audit.racerCount,
+      (
+        audit.errorCount === 0
+          ? 'PASS'
+          : 'FAIL'
+      )
+    ];
+  });
+
+  btaAppendSection_(
+    sheet,
+    headers,
+    rows
+  );
+
+  const lastRow = sheet.getLastRow();
+
+  sheet
+    .getRange(
+      lastRow - rows.length + 1,
+      3,
+      rows.length,
+      1
+    )
+    .setNumberFormat(
+      'yyyy-mm-dd hh:mm:ss'
+    );
+}
+
+/**
+ * Parameter_Testへ会場×コース実績を追記。
+ */
+function btaAppendVenueStats_(
+  sheet,
+  runId,
+  statsRows
+) {
+  const headers = [
+    'Run_ID',
+    'Report_Type',
+    'Period',
+    'Start_Date',
+    'End_Date',
+    '場コード',
+    '場',
+    'コース',
+    '出走数',
+    '1着数',
+    '1着率',
+    '2着率',
+    '3着率',
+    '2連対率',
+    '3連対率',
+    '逃げ勝ち',
+    '差し勝ち',
+    'まくり勝ち',
+    'まくり差し勝ち',
+    '抜き勝ち',
+    '恵まれ勝ち',
+    'Sample_Status'
+  ];
+
+  const rows = statsRows.map(function(x) {
+    return [
+      runId,
+      'VENUE_COURSE_STATS',
+      x.period,
+      x.startDate,
+      x.endDate,
+      x.venueCode,
+      x.venue,
+      x.course,
+      x.starts,
+      x.wins,
+      x.winRate,
+      x.secondRate,
+      x.thirdRate,
+      x.top2Rate,
+      x.top3Rate,
+      x.escapeWins,
+      x.differenceWins,
+      x.makuriWins,
+      x.makuriSashiWins,
+      x.nukiWins,
+      x.megumareWins,
+      x.sampleStatus
+    ];
+  });
+
+  btaAppendSection_(
+    sheet,
+    headers,
+    rows
+  );
+
+  const lastRow = sheet.getLastRow();
+  const startRow =
+    lastRow - rows.length + 1;
+
+  sheet
+    .getRange(
+      startRow,
+      4,
+      rows.length,
+      2
+    )
+    .setNumberFormat('yyyy-mm-dd');
+
+  sheet
+    .getRange(
+      startRow,
+      11,
+      rows.length,
+      5
+    )
+    .setNumberFormat('0.0%');
+}
+
+/**
+ * 既存シートの最終行へセクションとして追記。
+ * 既存データは削除しない。
+ */
+function btaAppendSection_(
+  sheet,
+  headers,
+  rows
+) {
+  if (!rows.length) {
+    return;
+  }
+
+  const startRow =
+    Math.max(sheet.getLastRow() + 2, 1);
+
+  const requiredLastRow =
+    startRow + rows.length;
+
+  if (
+    requiredLastRow >
+    sheet.getMaxRows()
+  ) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      requiredLastRow -
+      sheet.getMaxRows()
+    );
+  }
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      1,
+      headers.length
+    )
+    .setValues([headers]);
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      1,
+      headers.length
+    )
+    .setFontWeight('bold')
+    .setBackground('#D9EAF7');
+
+  sheet
+    .getRange(
+      startRow + 1,
+      1,
+      rows.length,
+      headers.length
+    )
+    .setValues(rows);
+
+  sheet
+    .getRange(
+      startRow,
+      1,
+      rows.length + 1,
+      headers.length
+    )
+    .setWrap(true);
+
+  sheet.setFrozenRows(
+    Math.max(
+      sheet.getFrozenRows(),
+      1
+    )
+  );
+}
+
+function btaAddAuditDetail_(
+  details,
+  level,
+  name,
+  count,
+  sample
+) {
+  details.push({
+    level: level,
+    name: name,
+    count: count,
+    sample: String(sample || '')
+  });
+}
+
+function btaCountBy_(rows, keyFunction) {
+  const counts = {};
+
+  rows.forEach(function(row) {
+    const key = keyFunction(row);
+
+    if (!key) {
+      return;
+    }
+
+    counts[key] =
+      (counts[key] || 0) + 1;
+  });
+
+  return counts;
+}
+
+function btaBuildHeaderMap_(
+  headers,
+  requiredHeaders,
+  sheetName
+) {
+  const map = {};
+
+  headers.forEach(function(value, index) {
+    map[String(value || '').trim()] =
+      index;
+  });
+
+  requiredHeaders.forEach(function(header) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        map,
+        header
+      )
+    ) {
+      throw new Error(
+        sheetName +
+        'に必須列がありません: ' +
+        header
+      );
+    }
+  });
+
+  return map;
+}
+
+function btaRequireSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error(
+      'シートがありません: ' + name
+    );
+  }
+
+  return sheet;
+}
+
+function btaDateList_(startText, endText) {
+  const start = btaParseDate_(startText);
+  const end = btaParseDate_(endText);
+  const output = [];
+
+  for (
+    let date = start;
+    date.getTime() <= end.getTime();
+    date = new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate() + 1
+    )
+  ) {
+    output.push(
+      Utilities.formatDate(
+        date,
+        BTA_CONFIG.TIMEZONE,
+        'yyyy-MM-dd'
+      )
+    );
+  }
+
+  return output;
+}
+
+function btaParseDate_(text) {
+  const match = String(text || '')
+    .match(
+      /^(\d{4})-(\d{2})-(\d{2})$/
+    );
+
+  if (!match) {
+    throw new Error(
+      '日付形式が不正です: ' + text
+    );
+  }
+
+  return new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3])
+  );
+}
+
+function btaDateText_(value) {
+  if (
+    value instanceof Date &&
+    !isNaN(value.getTime())
+  ) {
+    return Utilities.formatDate(
+      value,
+      BTA_CONFIG.TIMEZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  const text = String(value || '')
+    .trim();
+
+  const match = text.match(
+    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/
+  );
+
+  if (!match) {
+    return '';
+  }
+
+  return [
+    match[1],
+    ('0' + match[2]).slice(-2),
+    ('0' + match[3]).slice(-2)
+  ].join('-');
+}
+
+function btaPad2_(value) {
+  const number = parseInt(value, 10);
+
+  if (!Number.isFinite(number)) {
+    return String(value || '')
+      .padStart(2, '0');
+  }
+
+  return String(number).padStart(2, '0');
+}
+
+function btaIntOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number = parseInt(value, 10);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function btaNumberOrNull_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const number = Number(
+    String(value)
+      .replace(/,/g, '')
+      .replace('%', '')
+      .trim()
+  );
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+function btaNormalizeRateOrNull_(value) {
+  const number = btaNumberOrNull_(value);
+
+  if (number === null) {
+    return null;
+  }
+
+  return number > 1.5
+    ? number / 100
+    : number;
+}
+
+function btaBoolean_(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const text = String(value || '')
+    .trim()
+    .toLowerCase();
+
+  return (
+    text === 'true' ||
+    text === '1' ||
+    text === 'yes'
+  );
+}
+
+function btaRacerNumberText_(value) {
+  return String(value || '')
+    .replace(/\D/g, '')
+    .trim();
+}
+
+/**
+ * 日付化された過去値も可能な範囲で文字列へ戻す。
+ * 再取得後は通常の文字列が入っている想定。
+ */
+function btaCombinationText_(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return '';
+  }
+
+  if (
+    value instanceof Date &&
+    !isNaN(value.getTime())
+  ) {
+    return Utilities.formatDate(
+      value,
+      BTA_CONFIG.TIMEZONE,
+      'M-d'
+    );
+  }
+
+  return String(value).trim();
+}
+
+function btaSafeRate_(numerator, denominator) {
+  return denominator > 0
+    ? numerator / denominator
+    : 0;
+}
 

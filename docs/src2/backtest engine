@@ -1,1 +1,1233 @@
+/**
+ * ボートレースMC 50モデル比較エンジン v0.1.0
+ * ------------------------------------------------------------
+ * 既存の「履歴収集GAS」と同じApps Scriptプロジェクトへ、
+ * 新しい .gs ファイルとして追加してください。
+ *
+ * このコードは以下を前提にします。
+ * - BT_CONFIG
+ * - Backtest_Race
+ * - Backtest_Racer
+ * - Parameter_Test
+ * - Validation_Summary
+ * - Calibration_Bins
+ *
+ * 既存の履歴収集コードは削除しません。
+ *
+ * 比較内容:
+ * NOISE_SD: 18 / 22 / 26 / 30 / 34
+ * 会場補正重み: 0 / 0.25 / 0.50 / 0.75 / 1.00
+ * 相関: なし / 現行固定コレスキー
+ * 合計: 50モデル
+ *
+ * 試行回数:
+ * 各レース 1,000回
+ *
+ * 評価:
+ * - Top1 Accuracy
+ * - Multiclass Brier Score
+ * - Log Loss
+ * - 1号艇 Binary Brier
+ * - Best 2連単的中率
+ * - Best 2連複的中率
+ * - 1号艇確率校正
+ * - 最大1着率の確率校正
+ *
+ * 主な実行関数:
+ * 1. setupBacktest50Models()
+ * 2. startBacktest50Models()
+ * 3. getBacktest50Status()
+ *
+ * 手動で1モデルずつ進める場合:
+ * runNextBacktestModel()
+ */
 
+const BT_ENGINE = Object.freeze({
+  VERSION: 'bt_mc_50_v0.1.0',
+  MC_TRIALS: 1000,
+
+  NOISE_VALUES: Object.freeze([18, 22, 26, 30, 34]),
+  VENUE_WEIGHTS: Object.freeze([0, 0.25, 0.50, 0.75, 1.00]),
+  CORRELATION_MODES: Object.freeze(['none', 'fixed_cholesky_v1']),
+
+  PARAMETER_SHEET: 'Parameter_Test',
+  SUMMARY_SHEET: 'Validation_Summary',
+  CALIBRATION_SHEET: 'Calibration_Bins',
+  RACE_SHEET: 'Backtest_Race',
+  RACER_SHEET: 'Backtest_Racer',
+
+  PROPERTY_INDEX: 'BT50_NEXT_MODEL_INDEX',
+  PROPERTY_RUNNING: 'BT50_RUNNING',
+  PROPERTY_STARTED_AT: 'BT50_STARTED_AT',
+  PROPERTY_LAST_ERROR: 'BT50_LAST_ERROR',
+
+  TRIGGER_HANDLER: 'runNextBacktestModel',
+  EPSILON: 1e-12
+});
+
+
+/**
+ * 現行朝モデルと同じ固定相関。
+ */
+const BT_CORR_MATRIX = Object.freeze([
+  [ 1.000, -0.098,  0.000,  0.000,  0.000,  0.000],
+  [-0.098,  1.000, -0.340,  0.000,  0.000,  0.000],
+  [ 0.000, -0.340,  1.000,  0.000, -0.274,  0.000],
+  [ 0.000,  0.000,  0.000,  1.000,  0.000,  0.000],
+  [ 0.000,  0.000, -0.274,  0.000,  1.000,  0.041],
+  [ 0.000,  0.000,  0.000,  0.000,  0.041,  1.000]
+]);
+
+
+/**
+ * 現行Venue_masterのコース別加減点。
+ * [1, 2, 3, 4, 5, 6コース]
+ */
+const BT_VENUE_ADJUST = Object.freeze({
+  '01': {name:'桐生',   values:[-12, 0,  4,  8,  5,  2]},
+  '02': {name:'戸田',   values:[-18, 0, 10, 18, 14,  6]},
+  '03': {name:'江戸川', values:[-20, 0,  8, 16, 12,  8]},
+  '04': {name:'平和島', values:[  0, 0,  0,  0,  0,  0]},
+  '05': {name:'多摩川', values:[ 10, 0, -4, -6, -8,-10]},
+  '06': {name:'浜名湖', values:[  2, 0,  0,  2,  0,  0]},
+  '07': {name:'蒲郡',   values:[ 14, 0, -5, -8,-10,-12]},
+  '08': {name:'常滑',   values:[ 10, 0, -4, -6, -8,-10]},
+  '09': {name:'津',     values:[  4, 0,  0,  0,  0,  0]},
+  '10': {name:'三国',   values:[ -8, 0,  4,  8,  6,  2]},
+  '11': {name:'びわこ', values:[ -6, 0,  6, 12,  8,  2]},
+  '12': {name:'住之江', values:[  2, 0,  0,  2,  0,  0]},
+  '13': {name:'尼崎',   values:[ 12, 0, -4, -8,-10,-12]},
+  '14': {name:'鳴門',   values:[ 14, 0, -4, -6,-10,-12]},
+  '15': {name:'丸亀',   values:[  6, 0,  0,  0,  0,  0]},
+  '16': {name:'児島',   values:[ 16, 0, -6,-10,-12,-14]},
+  '17': {name:'宮島',   values:[ 20, 0, -8,-12,-16,-18]},
+  '18': {name:'徳山',   values:[ 18, 0, -6,-10,-12,-14]},
+  '19': {name:'下関',   values:[  4, 0,  0,  0,  0,  0]},
+  '20': {name:'若松',   values:[  0, 0,  4,  6,  4,  2]},
+  '21': {name:'芦屋',   values:[ 16, 0, -6,-10,-12,-14]},
+  '22': {name:'福岡',   values:[ -8, 0,  6, 10,  8,  4]},
+  '23': {name:'唐津',   values:[ 10, 0, -4, -6, -8,-10]},
+  '24': {name:'大村',   values:[ 24, 0, -8,-12,-16,-20]}
+});
+
+
+const BT_CLASS_POINTS = Object.freeze({
+  1: 8, // A1
+  2: 6, // A2
+  3: 3, // B1
+  4: 1  // B2
+});
+
+
+/**
+ * シート見出し・書式を確認します。
+ * 最初に1回実行してください。
+ */
+function setupBacktest50Models() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+
+  btEnsureHeaders_(
+    ss.getSheetByName(BT_ENGINE.PARAMETER_SHEET),
+    [
+      'Test_ID','期間区分','開始日','終了日','モデル名',
+      'Noise_SD','Venue_Weight','Correlation_Mode','MC_Trials',
+      '対象レース数','Top1_Accuracy','Brier_Score','Log_Loss',
+      '1号艇_Brier','Best_Exacta_Accuracy','Best_Quinella_Accuracy',
+      '作成日時','Memo'
+    ]
+  );
+
+  btEnsureHeaders_(
+    ss.getSheetByName(BT_ENGINE.SUMMARY_SHEET),
+    [
+      '順位','Test_ID','モデル名','Noise_SD','Venue_Weight','Correlation_Mode',
+      '対象レース数','Top1_Accuracy','Brier_Score','Log_Loss',
+      '1号艇_Brier','採用候補','Memo'
+    ]
+  );
+
+  btEnsureHeaders_(
+    ss.getSheetByName(BT_ENGINE.CALIBRATION_SHEET),
+    [
+      'Test_ID','対象','確率帯下限','確率帯上限','件数',
+      '平均予測確率','実的中率','差分','作成日時'
+    ]
+  );
+
+  btFormatOutputSheets_(ss);
+
+  const data = btLoadBacktestDataset_();
+  console.log(JSON.stringify({
+    status: 'READY',
+    validRaces: data.races.length,
+    startDate: data.startDate,
+    endDate: data.endDate,
+    modelCount: btBuildModelGrid_().length,
+    trialsPerRace: BT_ENGINE.MC_TRIALS
+  }, null, 2));
+}
+
+
+/**
+ * 50モデル比較を開始します。
+ *
+ * - 既存のParameter_Test / Validation_Summary / Calibration_Binsをクリア
+ * - 1モデル目をすぐ実行
+ * - 以後は1分ごとのトリガーで1モデルずつ進行
+ */
+function startBacktest50Models() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    throw new Error('別のバックテスト処理が実行中です。');
+  }
+
+  try {
+    setupBacktest50Models();
+
+    const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+    btClearDataRows_(ss.getSheetByName(BT_ENGINE.PARAMETER_SHEET));
+    btClearDataRows_(ss.getSheetByName(BT_ENGINE.SUMMARY_SHEET));
+    btClearDataRows_(ss.getSheetByName(BT_ENGINE.CALIBRATION_SHEET));
+
+    btDeleteEngineTriggers_();
+
+    const props = PropertiesService.getScriptProperties();
+    props.setProperties({
+      [BT_ENGINE.PROPERTY_INDEX]: '0',
+      [BT_ENGINE.PROPERTY_RUNNING]: 'true',
+      [BT_ENGINE.PROPERTY_STARTED_AT]: new Date().toISOString(),
+      [BT_ENGINE.PROPERTY_LAST_ERROR]: ''
+    });
+
+    ScriptApp
+      .newTrigger(BT_ENGINE.TRIGGER_HANDLER)
+      .timeBased()
+      .everyMinutes(1)
+      .create();
+
+    console.log('50モデル比較を開始しました。');
+  } finally {
+    lock.releaseLock();
+  }
+
+  // 1モデル目は待たずに実行
+  return runNextBacktestModel();
+}
+
+
+/**
+ * 次の1モデルだけを実行します。
+ * 時間主導トリガーからも、手動からも呼べます。
+ */
+function runNextBacktestModel() {
+  const lock = LockService.getScriptLock();
+
+  // 前のモデルがまだ走っている場合は、その回をスキップ
+  if (!lock.tryLock(1000)) {
+    console.log('前のモデルが実行中のため、今回はスキップしました。');
+    return {status: 'BUSY'};
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const running = props.getProperty(BT_ENGINE.PROPERTY_RUNNING);
+
+    if (running !== 'true') {
+      console.log('バックテストは開始されていません。');
+      return {status: 'NOT_RUNNING'};
+    }
+
+    const models = btBuildModelGrid_();
+    const index = Number(props.getProperty(BT_ENGINE.PROPERTY_INDEX) || 0);
+
+    if (index >= models.length) {
+      btFinish50Models_();
+      return {status: 'COMPLETED'};
+    }
+
+    const model = models[index];
+    console.log(
+      'モデル ' + (index + 1) + '/' + models.length +
+      ' を開始: ' + model.testId
+    );
+
+    const dataset = btLoadBacktestDataset_();
+    const result = btEvaluateModel_(dataset, model);
+
+    btWriteModelResult_(result);
+    btWriteCalibration_(result);
+
+    props.setProperty(BT_ENGINE.PROPERTY_INDEX, String(index + 1));
+    props.setProperty(BT_ENGINE.PROPERTY_LAST_ERROR, '');
+
+    console.log(JSON.stringify({
+      status: 'MODEL_COMPLETED',
+      completed: index + 1,
+      total: models.length,
+      testId: model.testId,
+      races: result.raceCount,
+      top1: result.top1Accuracy,
+      brier: result.brierScore,
+      logLoss: result.logLoss
+    }, null, 2));
+
+    if (index + 1 >= models.length) {
+      btFinish50Models_();
+      return {status: 'COMPLETED', completed: models.length};
+    }
+
+    return {
+      status: 'RUNNING',
+      completed: index + 1,
+      total: models.length,
+      current: model.testId
+    };
+
+  } catch (error) {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty(
+      BT_ENGINE.PROPERTY_LAST_ERROR,
+      error && error.stack ? error.stack : String(error)
+    );
+
+    console.error(error);
+    throw error;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * 進捗確認。
+ */
+function getBacktest50Status() {
+  const props = PropertiesService.getScriptProperties();
+  const models = btBuildModelGrid_();
+  const index = Number(props.getProperty(BT_ENGINE.PROPERTY_INDEX) || 0);
+
+  const status = {
+    running: props.getProperty(BT_ENGINE.PROPERTY_RUNNING) === 'true',
+    completedModels: Math.min(index, models.length),
+    totalModels: models.length,
+    progressPercent: Math.round(
+      Math.min(index, models.length) / models.length * 1000
+    ) / 10,
+    startedAt: props.getProperty(BT_ENGINE.PROPERTY_STARTED_AT) || '',
+    lastError: props.getProperty(BT_ENGINE.PROPERTY_LAST_ERROR) || ''
+  };
+
+  console.log(JSON.stringify(status, null, 2));
+  return status;
+}
+
+
+/**
+ * 安全停止。
+ * 既に出た結果は残ります。
+ */
+function stopBacktest50Models() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(BT_ENGINE.PROPERTY_RUNNING, 'false');
+  btDeleteEngineTriggers_();
+  console.log('バックテストを停止しました。');
+}
+
+
+/**
+ * 途中から再開。
+ */
+function resumeBacktest50Models() {
+  const props = PropertiesService.getScriptProperties();
+  const index = Number(props.getProperty(BT_ENGINE.PROPERTY_INDEX) || 0);
+  const total = btBuildModelGrid_().length;
+
+  if (index >= total) {
+    throw new Error('50モデルは既に完了しています。');
+  }
+
+  props.setProperty(BT_ENGINE.PROPERTY_RUNNING, 'true');
+  props.setProperty(BT_ENGINE.PROPERTY_LAST_ERROR, '');
+
+  btDeleteEngineTriggers_();
+  ScriptApp
+    .newTrigger(BT_ENGINE.TRIGGER_HANDLER)
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  return runNextBacktestModel();
+}
+
+
+/**
+ * 完了後、評価順にValidation_Summaryを作成します。
+ *
+ * 並び順:
+ * 1. Log Loss 昇順
+ * 2. Brier Score 昇順
+ * 3. Top1 Accuracy 降順
+ */
+function rebuildValidationSummary() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const parameterSheet = ss.getSheetByName(BT_ENGINE.PARAMETER_SHEET);
+  const summarySheet = ss.getSheetByName(BT_ENGINE.SUMMARY_SHEET);
+
+  btClearDataRows_(summarySheet);
+
+  const values = parameterSheet.getDataRange().getValues();
+  if (values.length <= 1) {
+    console.log('Parameter_Testに結果がありません。');
+    return;
+  }
+
+  const headers = values[0];
+  const map = btHeaderMap_(headers);
+
+  const rows = values.slice(1).filter(function(row) {
+    return String(row[map.Test_ID] || '').trim() !== '';
+  });
+
+  rows.sort(function(a, b) {
+    const logA = Number(a[map.Log_Loss]);
+    const logB = Number(b[map.Log_Loss]);
+    if (logA !== logB) return logA - logB;
+
+    const brierA = Number(a[map.Brier_Score]);
+    const brierB = Number(b[map.Brier_Score]);
+    if (brierA !== brierB) return brierA - brierB;
+
+    return Number(b[map.Top1_Accuracy]) - Number(a[map.Top1_Accuracy]);
+  });
+
+  const bestLogLoss = Number(rows[0][map.Log_Loss]);
+  const bestBrier = Math.min.apply(null, rows.map(function(row) {
+    return Number(row[map.Brier_Score]);
+  }));
+
+  const output = rows.map(function(row, i) {
+    const logLoss = Number(row[map.Log_Loss]);
+    const brier = Number(row[map.Brier_Score]);
+
+    const candidate =
+      i < 5 &&
+      logLoss <= bestLogLoss * 1.02 &&
+      brier <= bestBrier * 1.03;
+
+    return [
+      i + 1,
+      row[map.Test_ID],
+      row[map['モデル名']],
+      row[map.Noise_SD],
+      row[map.Venue_Weight],
+      row[map.Correlation_Mode],
+      row[map['対象レース数']],
+      row[map.Top1_Accuracy],
+      row[map.Brier_Score],
+      row[map.Log_Loss],
+      row[map['1号艇_Brier']],
+      candidate,
+      candidate
+        ? 'Log Loss・Brierの両方が上位。次期間で再検証候補。'
+        : ''
+    ];
+  });
+
+  if (output.length) {
+    summarySheet
+      .getRange(2, 1, output.length, output[0].length)
+      .setValues(output);
+  }
+
+  btFormatOutputSheets_(ss);
+  SpreadsheetApp.flush();
+
+  console.log('Validation_Summaryを再作成しました。');
+}
+
+
+/* =========================================================
+ * モデル評価
+ * ========================================================= */
+
+function btEvaluateModel_(dataset, model) {
+  const cholesky =
+    model.correlationMode === 'fixed_cholesky_v1'
+      ? btCholesky_(BT_CORR_MATRIX)
+      : btIdentityMatrix_(6);
+
+  let raceCount = 0;
+  let top1Hits = 0;
+  let brierSum = 0;
+  let logLossSum = 0;
+  let inBrierSum = 0;
+  let exactaHits = 0;
+  let quinellaHits = 0;
+
+  const calibrationIn = btEmptyBins_();
+  const calibrationTop = btEmptyBins_();
+
+  dataset.races.forEach(function(race) {
+    const boats = dataset.racersByRace[race.raceId];
+    if (!boats || boats.length !== 6) return;
+    if (!race.winner || !race.second) return;
+
+    const baseScores = boats.map(function(boat) {
+      return btBaseScore_(
+        boat,
+        boat.entryNumber,
+        race.venueCode,
+        model.venueWeight
+      );
+    });
+
+    const sim = btMonteCarloRace_(
+      baseScores,
+      cholesky,
+      model.noiseSd,
+      BT_ENGINE.MC_TRIALS,
+      btHashString_(race.raceId)
+    );
+
+    const p1 = sim.p1;
+    const predictedWinner = btArgMax_(p1) + 1;
+    const winnerIndex = race.winner - 1;
+
+    raceCount++;
+
+    if (predictedWinner === race.winner) top1Hits++;
+
+    let raceBrier = 0;
+    for (let i = 0; i < 6; i++) {
+      const actual = i === winnerIndex ? 1 : 0;
+      const diff = p1[i] - actual;
+      raceBrier += diff * diff;
+    }
+    // 6クラス平均
+    brierSum += raceBrier / 6;
+
+    logLossSum += -Math.log(
+      Math.max(p1[winnerIndex], BT_ENGINE.EPSILON)
+    );
+
+    const inActual = race.winner === 1 ? 1 : 0;
+    const inDiff = p1[0] - inActual;
+    inBrierSum += inDiff * inDiff;
+
+    if (sim.bestExacta === race.winner + '→' + race.second) {
+      exactaHits++;
+    }
+
+    const actualQuinella = [race.winner, race.second]
+      .sort(function(a, b) { return a - b; })
+      .join('=');
+
+    if (sim.bestQuinella === actualQuinella) {
+      quinellaHits++;
+    }
+
+    btAddCalibration_(calibrationIn, p1[0], inActual);
+
+    const maxP = Math.max.apply(null, p1);
+    const topActual = predictedWinner === race.winner ? 1 : 0;
+    btAddCalibration_(calibrationTop, maxP, topActual);
+  });
+
+  if (!raceCount) {
+    throw new Error('採点可能なレースがありません。');
+  }
+
+  return {
+    model: model,
+    startDate: dataset.startDate,
+    endDate: dataset.endDate,
+    raceCount: raceCount,
+
+    top1Accuracy: top1Hits / raceCount,
+    brierScore: brierSum / raceCount,
+    logLoss: logLossSum / raceCount,
+    inBrier: inBrierSum / raceCount,
+    exactaAccuracy: exactaHits / raceCount,
+    quinellaAccuracy: quinellaHits / raceCount,
+
+    calibrationIn: calibrationIn,
+    calibrationTop: calibrationTop,
+    createdAt: new Date()
+  };
+}
+
+
+function btMonteCarloRace_(
+  baseScores,
+  cholesky,
+  noiseSd,
+  trials,
+  seed
+) {
+  const winCounts = [0, 0, 0, 0, 0, 0];
+  const exacta = {};
+  const quinella = {};
+
+  const rng = btCreateRng_(seed);
+
+  for (let t = 0; t < trials; t++) {
+    const z = btSixNormals_(rng);
+    const corr = btMultiplyLower_(cholesky, z);
+
+    const ranking = [
+      {lane:1, value:baseScores[0] + corr[0] * noiseSd},
+      {lane:2, value:baseScores[1] + corr[1] * noiseSd},
+      {lane:3, value:baseScores[2] + corr[2] * noiseSd},
+      {lane:4, value:baseScores[3] + corr[3] * noiseSd},
+      {lane:5, value:baseScores[4] + corr[4] * noiseSd},
+      {lane:6, value:baseScores[5] + corr[5] * noiseSd}
+    ];
+
+    ranking.sort(function(a, b) {
+      return b.value - a.value;
+    });
+
+    const first = ranking[0].lane;
+    const second = ranking[1].lane;
+
+    winCounts[first - 1]++;
+
+    const exactaKey = first + '→' + second;
+    exacta[exactaKey] = (exacta[exactaKey] || 0) + 1;
+
+    const quinellaKey = [first, second]
+      .sort(function(a, b) { return a - b; })
+      .join('=');
+
+    quinella[quinellaKey] = (quinella[quinellaKey] || 0) + 1;
+  }
+
+  return {
+    p1: winCounts.map(function(count) {
+      return count / trials;
+    }),
+    bestExacta: btMaxKey_(exacta),
+    bestQuinella: btMaxKey_(quinella)
+  };
+}
+
+
+/**
+ * 現行朝MCの基礎スコアを再現。
+ * venueWeightのみ比較対象として外出ししています。
+ */
+function btBaseScore_(boat, course, venueCode, venueWeight) {
+  const classPoint = BT_CLASS_POINTS[boat.rankNumber] || 3;
+
+  const nationalWin = btFiniteOr_(boat.nationalWinRate, 4.5);
+  const localWin = btFiniteOr_(boat.localWinRate, nationalWin);
+
+  const national2 = btFiniteOr_(boat.national2Rate, 0.30);
+  const national3 = btFiniteOr_(boat.national3Rate, 0.48);
+  const local2 = btFiniteOr_(boat.local2Rate, national2);
+  const local3 = btFiniteOr_(boat.local3Rate, national3);
+
+  const avgSt =
+    Number.isFinite(boat.averageSt) && boat.averageSt > 0
+      ? boat.averageSt
+      : 0.18;
+
+  const motor2 = btFiniteOr_(boat.motor2Rate, 0.33);
+  const motor3 = btFiniteOr_(boat.motor3Rate, 0.50);
+  const boat2 = btFiniteOr_(boat.boat2Rate, 0.33);
+  const boat3 = btFiniteOr_(boat.boat3Rate, 0.50);
+  const flying = btFiniteOr_(boat.flyingCount, 0);
+
+  let score = 0;
+
+  score += 30;
+  score += classPoint * 2.2;
+  score += nationalWin * 4.0;
+  score += localWin * 1.8;
+  score += national2 * 16.0;
+  score += national3 * 6.0;
+  score += local2 * 5.0;
+  score += local3 * 2.0;
+  score += btClamp_((0.20 - avgSt) * 110, -5, 9);
+  score += (motor2 - 0.33) * 20.0;
+  score += (motor3 - 0.50) * 5.0;
+  score += (boat2 - 0.33) * 7.0;
+  score += (boat3 - 0.50) * 2.0;
+  score -= flying * 2.5;
+
+  const courseBase = [20, 6, 2, 0, -5, -10][course - 1];
+  score += courseBase;
+
+  const venue = BT_VENUE_ADJUST[String(venueCode).padStart(2, '0')];
+  if (venue) {
+    score += venue.values[course - 1] * venueWeight;
+  }
+
+  return score;
+}
+
+
+/* =========================================================
+ * Dataset読込
+ * ========================================================= */
+
+function btLoadBacktestDataset_() {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const raceSheet = ss.getSheetByName(BT_ENGINE.RACE_SHEET);
+  const racerSheet = ss.getSheetByName(BT_ENGINE.RACER_SHEET);
+
+  if (!raceSheet || !racerSheet) {
+    throw new Error('Backtest_RaceまたはBacktest_Racerがありません。');
+  }
+
+  const raceValues = raceSheet.getDataRange().getValues();
+  const racerValues = racerSheet.getDataRange().getValues();
+
+  if (raceValues.length <= 1 || racerValues.length <= 1) {
+    throw new Error('履歴データがありません。先にimportInitial7Daysを実行してください。');
+  }
+
+  const raceMap = btHeaderMap_(raceValues[0]);
+  const racerMap = btHeaderMap_(racerValues[0]);
+
+  const races = [];
+  const racersByRace = {};
+
+  raceValues.slice(1).forEach(function(row) {
+    const raceId = String(row[raceMap.Race_ID] || '').trim();
+    if (!raceId) return;
+
+    const resultExists = btAsBoolean_(row[raceMap['Result有']]);
+    const winner = Number(row[raceMap['1着艇']]);
+    const second = Number(row[raceMap['2着艇']]);
+    const third = Number(row[raceMap['3着艇']]);
+
+    if (!resultExists) return;
+    if (!(winner >= 1 && winner <= 6)) return;
+    if (!(second >= 1 && second <= 6)) return;
+
+    races.push({
+      raceId: raceId,
+      dateText: btDateText_(row[raceMap['日付']]),
+      venueCode: String(row[raceMap['場コード']] || '').padStart(2, '0'),
+      venueName: String(row[raceMap['場']] || ''),
+      raceNo: Number(row[raceMap.R]),
+      winner: winner,
+      second: second,
+      third: third
+    });
+  });
+
+  racerValues.slice(1).forEach(function(row) {
+    const raceId = String(row[racerMap.Race_ID] || '').trim();
+    const entry = Number(row[racerMap['艇番']]);
+
+    if (!raceId || !(entry >= 1 && entry <= 6)) return;
+
+    if (!racersByRace[raceId]) racersByRace[raceId] = [];
+
+    racersByRace[raceId].push({
+      entryNumber: entry,
+      rankNumber: Number(row[racerMap['級別番号']]),
+      flyingCount: Number(row[racerMap['F数']]),
+      averageSt: Number(row[racerMap['平均ST']]),
+
+      nationalWinRate: Number(row[racerMap['全国勝率']]),
+      national2Rate: Number(row[racerMap['全国2連率']]),
+      national3Rate: Number(row[racerMap['全国3連率']]),
+
+      localWinRate: Number(row[racerMap['当地勝率']]),
+      local2Rate: Number(row[racerMap['当地2連率']]),
+      local3Rate: Number(row[racerMap['当地3連率']]),
+
+      motor2Rate: Number(row[racerMap['モーター2連率']]),
+      motor3Rate: Number(row[racerMap['モーター3連率']]),
+
+      boat2Rate: Number(row[racerMap['ボート2連率']]),
+      boat3Rate: Number(row[racerMap['ボート3連率']])
+    });
+  });
+
+  Object.keys(racersByRace).forEach(function(raceId) {
+    racersByRace[raceId].sort(function(a, b) {
+      return a.entryNumber - b.entryNumber;
+    });
+  });
+
+  const validRaces = races.filter(function(race) {
+    const boats = racersByRace[race.raceId];
+    if (!boats || boats.length !== 6) return false;
+
+    for (let i = 0; i < 6; i++) {
+      if (boats[i].entryNumber !== i + 1) return false;
+    }
+    return true;
+  });
+
+  if (!validRaces.length) {
+    throw new Error('6艇・結果ありの有効レースがありません。');
+  }
+
+  const dates = validRaces
+    .map(function(race) { return race.dateText; })
+    .filter(function(value) { return value; })
+    .sort();
+
+  return {
+    races: validRaces,
+    racersByRace: racersByRace,
+    startDate: dates[0],
+    endDate: dates[dates.length - 1]
+  };
+}
+
+
+/* =========================================================
+ * 結果出力
+ * ========================================================= */
+
+function btWriteModelResult_(result) {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(BT_ENGINE.PARAMETER_SHEET);
+
+  const row = [
+    result.model.testId,
+    '初期7日',
+    result.startDate,
+    result.endDate,
+    result.model.modelName,
+    result.model.noiseSd,
+    result.model.venueWeight,
+    result.model.correlationMode,
+    BT_ENGINE.MC_TRIALS,
+    result.raceCount,
+    result.top1Accuracy,
+    result.brierScore,
+    result.logLoss,
+    result.inBrier,
+    result.exactaAccuracy,
+    result.quinellaAccuracy,
+    result.createdAt,
+    '同一Race_IDでは全モデル共通の乱数系列を使用。'
+  ];
+
+  const nextRow = btFindLastDataRow_(sheet, 1) + 1;
+  sheet.getRange(nextRow, 1, 1, row.length).setValues([row]);
+
+  btFormatOutputSheets_(ss);
+  SpreadsheetApp.flush();
+}
+
+
+function btWriteCalibration_(result) {
+  const ss = SpreadsheetApp.openById(BT_CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(BT_ENGINE.CALIBRATION_SHEET);
+
+  const rows = [];
+
+  btCalibrationRows_(
+    result.model.testId,
+    '1号艇1着率',
+    result.calibrationIn,
+    result.createdAt
+  ).forEach(function(row) {
+    rows.push(row);
+  });
+
+  btCalibrationRows_(
+    result.model.testId,
+    '最大1着率',
+    result.calibrationTop,
+    result.createdAt
+  ).forEach(function(row) {
+    rows.push(row);
+  });
+
+  if (!rows.length) return;
+
+  const nextRow = btFindLastDataRow_(sheet, 1) + 1;
+  sheet.getRange(nextRow, 1, rows.length, rows[0].length).setValues(rows);
+
+  btFormatOutputSheets_(ss);
+  SpreadsheetApp.flush();
+}
+
+
+function btFinish50Models_() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(BT_ENGINE.PROPERTY_RUNNING, 'false');
+
+  btDeleteEngineTriggers_();
+  rebuildValidationSummary();
+
+  console.log('50モデル比較が完了しました。');
+}
+
+
+/* =========================================================
+ * モデルグリッド
+ * ========================================================= */
+
+function btBuildModelGrid_() {
+  const models = [];
+
+  BT_ENGINE.NOISE_VALUES.forEach(function(noise) {
+    BT_ENGINE.VENUE_WEIGHTS.forEach(function(venueWeight) {
+      BT_ENGINE.CORRELATION_MODES.forEach(function(correlationMode) {
+        const venueText = String(venueWeight).replace('.', 'p');
+        const corrText =
+          correlationMode === 'none' ? 'independent' : 'cholesky';
+
+        models.push({
+          testId:
+            'N' + noise +
+            '_V' + venueText +
+            '_' + corrText +
+            '_' + BT_ENGINE.VERSION,
+
+          modelName:
+            'Noise=' + noise +
+            ' / Venue=' + venueWeight +
+            ' / Corr=' + correlationMode,
+
+          noiseSd: noise,
+          venueWeight: venueWeight,
+          correlationMode: correlationMode
+        });
+      });
+    });
+  });
+
+  return models;
+}
+
+
+/* =========================================================
+ * Calibration
+ * ========================================================= */
+
+function btEmptyBins_() {
+  return Array.from({length: 10}, function() {
+    return {
+      count: 0,
+      predictedSum: 0,
+      actualSum: 0
+    };
+  });
+}
+
+
+function btAddCalibration_(bins, probability, actual) {
+  const p = btClamp_(Number(probability), 0, 1);
+  const index = Math.min(Math.floor(p * 10), 9);
+
+  bins[index].count++;
+  bins[index].predictedSum += p;
+  bins[index].actualSum += actual;
+}
+
+
+function btCalibrationRows_(testId, target, bins, createdAt) {
+  return bins.map(function(bin, i) {
+    const lower = i / 10;
+    const upper = (i + 1) / 10;
+
+    const averagePredicted =
+      bin.count ? bin.predictedSum / bin.count : '';
+
+    const actualRate =
+      bin.count ? bin.actualSum / bin.count : '';
+
+    const difference =
+      bin.count ? actualRate - averagePredicted : '';
+
+    return [
+      testId,
+      target,
+      lower,
+      upper,
+      bin.count,
+      averagePredicted,
+      actualRate,
+      difference,
+      createdAt
+    ];
+  });
+}
+
+
+/* =========================================================
+ * 乱数・行列
+ * ========================================================= */
+
+/**
+ * Race_IDだけをseedにするため、全モデルで同一レースには
+ * 同じ標準正規乱数系列を使用します。
+ * モデル間比較のMonte Carloノイズを抑える狙いです。
+ */
+function btCreateRng_(seed) {
+  let state = (seed >>> 0) || 123456789;
+
+  return function() {
+    state = (1664525 * state + 1013904223) >>> 0;
+    return (state + 0.5) / 4294967296;
+  };
+}
+
+
+function btSixNormals_(rng) {
+  const result = [];
+
+  while (result.length < 6) {
+    const u1 = Math.max(rng(), 1e-12);
+    const u2 = rng();
+
+    const radius = Math.sqrt(-2 * Math.log(u1));
+    const angle = 2 * Math.PI * u2;
+
+    result.push(radius * Math.cos(angle));
+    if (result.length < 6) {
+      result.push(radius * Math.sin(angle));
+    }
+  }
+
+  return result;
+}
+
+
+function btHashString_(text) {
+  let hash = 2166136261;
+
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+
+function btCholesky_(matrix) {
+  const n = matrix.length;
+  const lower = Array.from({length: n}, function() {
+    return Array(n).fill(0);
+  });
+
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = 0;
+
+      for (let k = 0; k < j; k++) {
+        sum += lower[i][k] * lower[j][k];
+      }
+
+      if (i === j) {
+        const value = matrix[i][i] - sum;
+        lower[i][j] = Math.sqrt(Math.max(value, 1e-12));
+      } else {
+        lower[i][j] =
+          (matrix[i][j] - sum) / lower[j][j];
+      }
+    }
+  }
+
+  return lower;
+}
+
+
+function btIdentityMatrix_(n) {
+  return Array.from({length: n}, function(_, i) {
+    return Array.from({length: n}, function(__, j) {
+      return i === j ? 1 : 0;
+    });
+  });
+}
+
+
+function btMultiplyLower_(lower, vector) {
+  const result = Array(lower.length).fill(0);
+
+  for (let i = 0; i < lower.length; i++) {
+    let sum = 0;
+
+    for (let j = 0; j <= i; j++) {
+      sum += lower[i][j] * vector[j];
+    }
+
+    result[i] = sum;
+  }
+
+  return result;
+}
+
+
+/* =========================================================
+ * Sheets・共通処理
+ * ========================================================= */
+
+function btFormatOutputSheets_(ss) {
+  const parameter = ss.getSheetByName(BT_ENGINE.PARAMETER_SHEET);
+  const summary = ss.getSheetByName(BT_ENGINE.SUMMARY_SHEET);
+  const calibration = ss.getSheetByName(BT_ENGINE.CALIBRATION_SHEET);
+
+  [parameter, summary, calibration].forEach(function(sheet) {
+    if (!sheet) return;
+
+    const lastColumn = sheet.getLastColumn();
+
+    sheet.getRange(1, 1, 1, lastColumn)
+      .setFontWeight('bold')
+      .setBackground('#d9eaf7')
+      .setWrap(true);
+
+    sheet.setFrozenRows(1);
+  });
+
+  parameter.getRange('K2:P').setNumberFormat('0.0000');
+  parameter.getRange('Q2:Q').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+
+  summary.getRange('H2:K').setNumberFormat('0.0000');
+
+  calibration.getRange('C2:D').setNumberFormat('0%');
+  calibration.getRange('F2:H').setNumberFormat('0.0%');
+  calibration.getRange('I2:I').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+}
+
+
+function btEnsureHeaders_(sheet, headers) {
+  if (!sheet) throw new Error('必要なシートがありません。');
+
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(
+      sheet.getMaxColumns(),
+      headers.length - sheet.getMaxColumns()
+    );
+  }
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+}
+
+
+function btClearDataRows_(sheet) {
+  if (!sheet) return;
+
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow > 1 && lastColumn > 0) {
+    sheet
+      .getRange(2, 1, lastRow - 1, lastColumn)
+      .clearContent();
+  }
+}
+
+
+function btFindLastDataRow_(sheet, idColumn) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 1;
+
+  const values = sheet
+    .getRange(2, idColumn, lastRow - 1, 1)
+    .getDisplayValues();
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][0] || '').trim() !== '') {
+      return i + 2;
+    }
+  }
+
+  return 1;
+}
+
+
+function btHeaderMap_(headers) {
+  const map = {};
+
+  headers.forEach(function(header, i) {
+    map[String(header)] = i;
+  });
+
+  return map;
+}
+
+
+function btDeleteEngineTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (
+      trigger.getHandlerFunction() ===
+      BT_ENGINE.TRIGGER_HANDLER
+    ) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+function btAsBoolean_(value) {
+  return value === true ||
+    String(value).toUpperCase() === 'TRUE' ||
+    String(value) === '1';
+}
+
+
+function btDateText_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(
+      value,
+      BT_CONFIG.TIMEZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  const text = String(value || '').trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+
+  return match
+    ? match[1] + '-' + match[2] + '-' + match[3]
+    : text;
+}
+
+
+function btArgMax_(array) {
+  let bestIndex = 0;
+  let bestValue = -Infinity;
+
+  array.forEach(function(value, i) {
+    if (value > bestValue) {
+      bestValue = value;
+      bestIndex = i;
+    }
+  });
+
+  return bestIndex;
+}
+
+
+function btMaxKey_(object) {
+  let bestKey = '';
+  let bestValue = -Infinity;
+
+  Object.keys(object).forEach(function(key) {
+    if (object[key] > bestValue) {
+      bestValue = object[key];
+      bestKey = key;
+    }
+  });
+
+  return bestKey;
+}
+
+
+function btFiniteOr_(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+
+function btClamp_(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+  
+　　　　

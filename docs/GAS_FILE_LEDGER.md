@@ -10,7 +10,7 @@
 | baseline_comparison.gs | ６月データから７月初旬のテスト | - | 今後不要 | - |
 | current_mc_holdout.gs | ７月初旬モンテカルロテスト | - | 今後不要 | - |
 | 2026may.gs | 2026年5月データ取得用 | - | 今後不要 | - |
-| screening.gs | BUY/WATCH/PASS判定 | - | 未登録 | - |
+| チェック.gs | 2026年6月検証用 | - | 今後不要 | - |
 | race_summary.gs | Race_Logへの出力 | - | 未登録 | - |
 | logging.gs | 検証ログ・購入ログ | - | 未登録 | - |
 | notification.gs | Discord等への通知 | - | 未登録 | - |

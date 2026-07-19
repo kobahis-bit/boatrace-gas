@@ -7,7 +7,7 @@
 | morning code.gs | メイン実行GAS | - | 仮運用中 | - |
 | コード.gs | バックテスト用７月初旬 | - | 今後不要 | - |
 | backtest engine.gs | エンジン検証用① | - | 今後不要 | - |
-| monte_carlo.gs | Monte Carlo計算 | - | 未登録 | - |
+| baseline_comparison.gs | ６月データから７月初旬のテスト | - | 今後不要 | - |
 | probability.gs | 確率計算・正規化 | - | 未登録 | - |
 | market_analysis.gs | オッズ・EV計算 | - | 未登録 | - |
 | screening.gs | BUY/WATCH/PASS判定 | - | 未登録 | - |
